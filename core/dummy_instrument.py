@@ -42,12 +42,19 @@ class DummyKeithley2636(AbstractSMU):
         start_v: float,
         stop_v: float,
         points: int,
+        delay: float = 0.0,
+        nplc: float = 1.0,
+        ramp_up: bool = False,
+        ru_step: float = 0.5,
+        ru_delay: float = 0.1,
+        ramp_down: bool = False,
+        rd_step: float = 0.5,
+        rd_delay: float = 0.1,
     ) -> tuple[list[float], list[float]]:
         """Return linear voltage sweep and fake currents."""
         if points < 1:
             return [], []
         step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
         voltages = [start_v + i * step for i in range(points)]
-        # Fake current: small linear ramp for a plausible-looking curve
         currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
         return voltages, currents

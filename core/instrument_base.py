@@ -85,6 +85,14 @@ class AbstractSMU(ABC):
         start_v: float,
         stop_v: float,
         points: int,
+        delay: float = 0.0,
+        nplc: float = 1.0,
+        ramp_up: bool = False,
+        ru_step: float = 0.5,
+        ru_delay: float = 0.1,
+        ramp_down: bool = False,
+        rd_step: float = 0.5,
+        rd_delay: float = 0.1,
     ) -> tuple[list[float], list[float]]:
         """
         Run a linear voltage sweep (IV sweep) on the specified channel.
@@ -95,10 +103,18 @@ class AbstractSMU(ABC):
             stop_v: Stop voltage in V.
             points: Number of sweep points (including endpoints); voltage
                 is linearly spaced between start_v and stop_v.
+            delay: Source-to-measure delay in seconds for each step.
+            nplc: Integration time in PLC (power-line cycles) per measurement.
+            ramp_up: If True, ramp from 0 V to start_v before the sweep.
+            ru_step: Ramp-up voltage step in V.
+            ru_delay: Ramp-up step delay in s.
+            ramp_down: If True, ramp from stop_v to 0 V after the sweep.
+            rd_step: Ramp-down voltage step in V.
+            rd_delay: Ramp-down step delay in s.
 
         Returns:
             Tuple (voltages, currents):
-            - voltages: List of voltages, length equals points.
-            - currents: List of corresponding currents, length equals points.
+            - voltages: List of actual source voltages (may include ramp points).
+            - currents: List of corresponding currents, same length as voltages.
         """
         pass

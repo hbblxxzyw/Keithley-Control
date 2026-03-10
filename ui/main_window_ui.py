@@ -121,38 +121,41 @@ class MainWindowUI(QMainWindow):
         summary_group = QGroupBox("Device Summary")
         summary_layout = QVBoxLayout(summary_group)
 
-        # SMU 1 status: Mode, Source, Limit
+        # SMU 1 status: Function, Mode, Source, Limit, Ramp
         smu1_group = QGroupBox("SMU 1")
         smu1_layout = QFormLayout(smu1_group)
+        self.smu1_function_label = QLabel("—")
         self.smu1_mode_label = QLabel("—")
         self.smu1_source_label = QLabel("—")
-        self.smu1_points_label = QLabel("—")
         self.smu1_limit_label = QLabel("—")
+        self.smu1_ramp_label = QLabel("—")
+        smu1_layout.addRow("Function:", self.smu1_function_label)
         smu1_layout.addRow("Mode:", self.smu1_mode_label)
-        smu1_layout.addRow("", self.smu1_source_label)
-        smu1_layout.addRow("Points:", self.smu1_points_label)
+        smu1_layout.addRow("Source:", self.smu1_source_label)
         smu1_layout.addRow("Limit:", self.smu1_limit_label)
+        smu1_layout.addRow("Ramp:", self.smu1_ramp_label)
         summary_layout.addWidget(smu1_group)
 
-        # SMU 2 status: Mode, Source, Limit
+        # SMU 2 status: Function, Mode, Source, Limit, Ramp
         smu2_group = QGroupBox("SMU 2")
         smu2_layout = QFormLayout(smu2_group)
+        self.smu2_function_label = QLabel("—")
         self.smu2_mode_label = QLabel("—")
         self.smu2_source_label = QLabel("—")
-        self.smu2_points_label = QLabel("—")
         self.smu2_limit_label = QLabel("—")
+        self.smu2_ramp_label = QLabel("—")
+        smu2_layout.addRow("Function:", self.smu2_function_label)
         smu2_layout.addRow("Mode:", self.smu2_mode_label)
-        smu2_layout.addRow("", self.smu2_source_label)
-        smu2_layout.addRow("Points:", self.smu2_points_label)
+        smu2_layout.addRow("Source:", self.smu2_source_label)
         smu2_layout.addRow("Limit:", self.smu2_limit_label)
+        smu2_layout.addRow("Ramp:", self.smu2_ramp_label)
         summary_layout.addWidget(smu2_group)
 
         summary_layout.addStretch()
-        lower_layout.addWidget(summary_group)
+        lower_layout.addWidget(summary_group, 1)
 
         # --- Middle: Channel Settings (StackedWidget: one form per SMU) ---
         channel_group = QGroupBox("Channel Settings")
-        channel_group.setMaximumWidth(320)
         channel_layout = QVBoxLayout(channel_group)
 
         self.smu_selector = QComboBox()
@@ -165,7 +168,7 @@ class MainWindowUI(QMainWindow):
         self.smu_selector.currentIndexChanged.connect(self.channel_stacked.setCurrentIndex)
         self._connect_smu_form_signals()
         channel_layout.addWidget(self.channel_stacked)
-        lower_layout.addWidget(channel_group)
+        lower_layout.addWidget(channel_group, 1)
 
         # --- Right: Common Settings ---
         common_group = QGroupBox("Common Settings")
@@ -238,7 +241,9 @@ class MainWindowUI(QMainWindow):
             "QPushButton { background-color: #2d7d2d; color: white; font-weight: bold; }"
             "QPushButton:hover { background-color: #3d9d3d; }"
             "QPushButton:pressed { background-color: #1d5d1d; }"
+            "QPushButton:disabled { background-color: #808080; color: #d0d0d0; }"
         )
+        self.run_btn.setEnabled(False)
         common_layout.addRow(self.run_btn)
 
         self.abort_btn = QPushButton("Abort")
@@ -248,10 +253,12 @@ class MainWindowUI(QMainWindow):
             "QPushButton { background-color: #b71c1c; color: white; font-weight: bold; }"
             "QPushButton:hover { background-color: #d32f2f; }"
             "QPushButton:pressed { background-color: #8b0000; }"
+            "QPushButton:disabled { background-color: #808080; color: #d0d0d0; }"
         )
+        self.abort_btn.setEnabled(False)
         common_layout.addRow(self.abort_btn)
 
-        lower_layout.addWidget(common_group)
+        lower_layout.addWidget(common_group, 1)
 
         layout.addLayout(lower_layout)
 
@@ -271,6 +278,63 @@ class MainWindowUI(QMainWindow):
         dual_sweep_check = QCheckBox("Dual Sweep")
         form.addRow("", dual_sweep_check)
 
+        # Ramp Up / Ramp Down (visible only when Function is Voltage)
+        ramp_container = QWidget()
+        ramp_container_layout = QVBoxLayout(ramp_container)
+        ramp_container_layout.setContentsMargins(0, 0, 0, 0)
+
+        ramp_up_check = QCheckBox("Ramp Up from 0V")
+        ramp_container_layout.addWidget(ramp_up_check)
+        ramp_up_step = QDoubleSpinBox()
+        ramp_up_step.setRange(0.01, 1000.0)
+        ramp_up_step.setValue(0.5)
+        ramp_up_step.setSuffix(" V")
+        ramp_up_step.setDecimals(3)
+        ramp_up_delay = QDoubleSpinBox()
+        ramp_up_delay.setRange(0.0, 3600.0)
+        ramp_up_delay.setValue(1.0)
+        ramp_up_delay.setSuffix(" s")
+        ramp_up_delay.setDecimals(2)
+        ramp_up_row = QWidget()
+        ramp_up_hbox = QHBoxLayout(ramp_up_row)
+        ramp_up_hbox.setContentsMargins(0, 0, 0, 0)
+        ramp_up_hbox.addWidget(ramp_up_step)
+        ramp_up_hbox.addWidget(ramp_up_delay)
+        ramp_container_layout.addWidget(ramp_up_row)
+
+        ramp_down_check = QCheckBox("Ramp Down to 0V")
+        ramp_container_layout.addWidget(ramp_down_check)
+        ramp_down_step = QDoubleSpinBox()
+        ramp_down_step.setRange(0.01, 1000.0)
+        ramp_down_step.setValue(0.5)
+        ramp_down_step.setSuffix(" V")
+        ramp_down_step.setDecimals(3)
+        ramp_down_delay = QDoubleSpinBox()
+        ramp_down_delay.setRange(0.0, 3600.0)
+        ramp_down_delay.setValue(1.0)
+        ramp_down_delay.setSuffix(" s")
+        ramp_down_delay.setDecimals(2)
+        ramp_down_row = QWidget()
+        ramp_down_hbox = QHBoxLayout(ramp_down_row)
+        ramp_down_hbox.setContentsMargins(0, 0, 0, 0)
+        ramp_down_hbox.addWidget(ramp_down_step)
+        ramp_down_hbox.addWidget(ramp_down_delay)
+        ramp_container_layout.addWidget(ramp_down_row)
+
+        def update_ramp_visibility() -> None:
+            is_voltage = function_combo.currentText() == "Voltage"
+            ramp_container.setVisible(is_voltage)
+            if is_voltage:
+                ramp_up_row.setVisible(ramp_up_check.isChecked())
+                ramp_down_row.setVisible(ramp_down_check.isChecked())
+
+        function_combo.currentTextChanged.connect(update_ramp_visibility)
+        ramp_up_check.stateChanged.connect(update_ramp_visibility)
+        ramp_down_check.stateChanged.connect(update_ramp_visibility)
+        update_ramp_visibility()
+
+        form.addRow("", ramp_container)
+
         level_spin = QDoubleSpinBox()
         level_spin.setRange(-1e3, 1e3)
         level_spin.setDecimals(4)
@@ -287,7 +351,7 @@ class MainWindowUI(QMainWindow):
         form.addRow("Stop:", stop_spin)
 
         step_display = QLabel("0.000 V")
-        step_display.setStyleSheet("background-color: #e0e0e0; color: #333; padding: 2px;")
+        step_display.setStyleSheet("color: white; padding: 2px;")
         form.addRow("Step:", step_display)
 
         limit_spin = QDoubleSpinBox()
@@ -299,6 +363,15 @@ class MainWindowUI(QMainWindow):
         setattr(self, f"function_combo_smu{smu_index}", function_combo)
         setattr(self, f"mode_combo_smu{smu_index}", mode_combo)
         setattr(self, f"dual_sweep_check_smu{smu_index}", dual_sweep_check)
+        setattr(self, f"ramp_container_smu{smu_index}", ramp_container)
+        setattr(self, f"ramp_up_check_smu{smu_index}", ramp_up_check)
+        setattr(self, f"ramp_up_step_smu{smu_index}", ramp_up_step)
+        setattr(self, f"ramp_up_delay_smu{smu_index}", ramp_up_delay)
+        setattr(self, f"ramp_up_row_smu{smu_index}", ramp_up_row)
+        setattr(self, f"ramp_down_check_smu{smu_index}", ramp_down_check)
+        setattr(self, f"ramp_down_step_smu{smu_index}", ramp_down_step)
+        setattr(self, f"ramp_down_delay_smu{smu_index}", ramp_down_delay)
+        setattr(self, f"ramp_down_row_smu{smu_index}", ramp_down_row)
         setattr(self, f"level_spin_smu{smu_index}", level_spin)
         setattr(self, f"start_spin_smu{smu_index}", start_spin)
         setattr(self, f"stop_spin_smu{smu_index}", stop_spin)
@@ -314,6 +387,12 @@ class MainWindowUI(QMainWindow):
             getattr(self, f"mode_combo_smu{i}").currentTextChanged.connect(self.emit_config_changed)
             getattr(self, f"mode_combo_smu{i}").currentIndexChanged.connect(self.emit_config_changed)
             getattr(self, f"dual_sweep_check_smu{i}").stateChanged.connect(self.emit_config_changed)
+            getattr(self, f"ramp_up_check_smu{i}").stateChanged.connect(self.emit_config_changed)
+            getattr(self, f"ramp_up_step_smu{i}").valueChanged.connect(self.emit_config_changed)
+            getattr(self, f"ramp_up_delay_smu{i}").valueChanged.connect(self.emit_config_changed)
+            getattr(self, f"ramp_down_check_smu{i}").stateChanged.connect(self.emit_config_changed)
+            getattr(self, f"ramp_down_step_smu{i}").valueChanged.connect(self.emit_config_changed)
+            getattr(self, f"ramp_down_delay_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"level_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"start_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"stop_spin_smu{i}").valueChanged.connect(self.emit_config_changed)

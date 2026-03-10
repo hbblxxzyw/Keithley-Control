@@ -105,21 +105,118 @@ class RealKeithley2636(AbstractSMU):
         start_v: float,
         stop_v: float,
         points: int,
+        delay: float = 0.0,
+        nplc: float = 1.0,
+        ramp_up: bool = False,
+        ru_step: float = 0.5,
+        ru_delay: float = 0.1,
+        ramp_down: bool = False,
+        rd_step: float = 0.5,
+        rd_delay: float = 0.1,
     ) -> tuple[list[float], list[float]]:
         """
-        Run a linear voltage sweep: evenly spaced points in [start_v, stop_v],
-        set voltage and measure current at each point; return (voltages, currents).
+        Run a linear voltage sweep by pushing a TSP script to the instrument.
+
+        The script performs the sweep on the instrument side (optionally with
+        safe_ramp up/down), stores voltages and currents in nvbuffer1, then
+        we fetch the data dynamically by buffer length.
         """
         if points < 1:
             return [], []
 
-        step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
-        voltages = [start_v + i * step for i in range(points)]
-        currents: list[float] = []
+        # Configure buffer: clear, enable source value collection, append mode
+        self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
+        self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
+        self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
+        self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
 
-        for v in voltages:
-            self._send_cmd(f"{smu_channel}.source.levelv = {v}")
-            reply = self._query_cmd(f"print({smu_channel}.measure.i())")
-            currents.append(float(reply))
+        # Lua safe_ramp: ramps voltage with steps, measures at each step into buffer
+        safe_ramp_def = """
+function safe_ramp(channel, target_v, step_v, delay_s, buffer)
+    local current_v = channel.source.levelv
+    if current_v == nil then current_v = 0.0 end
+    local diff = target_v - current_v
+    local dir = 1
+    if diff < 0 then dir = -1 end
+    while math.abs(target_v - current_v) > step_v do
+        current_v = current_v + dir * step_v
+        channel.source.levelv = current_v
+        delay(delay_s)
+        channel.measure.i(buffer)
+    end
+    channel.source.levelv = target_v
+    delay(delay_s)
+    channel.measure.i(buffer)
+end
+"""
+        # Build main script: define safe_ramp, then optional ramp_up, sweep loop, optional ramp_down
+        script = safe_ramp_def + f"""
+local start_v = {start_v}
+local stop_v = {stop_v}
+local points = {points}
+local delay_s = {delay}
+local step_v
+if points <= 1 then
+    step_v = 0
+else
+    step_v = (stop_v - start_v) / (points - 1)
+end
+"""
+        if ramp_up:
+            script += f"""
+{smu_channel}.source.levelv = 0
+{smu_channel}.source.output = {smu_channel}.OUTPUT_ON
+safe_ramp({smu_channel}, start_v, {ru_step}, {ru_delay}, {smu_channel}.nvbuffer1)
+"""
+        script += f"""
+for i = 0, points - 1 do
+    local v = start_v + i * step_v
+    {smu_channel}.source.levelv = v
+    delay(delay_s)
+    {smu_channel}.measure.i({smu_channel}.nvbuffer1)
+end
+"""
+        if ramp_down:
+            script += f"""
+safe_ramp({smu_channel}, 0.0, {rd_step}, {rd_delay}, {smu_channel}.nvbuffer1)
+"""
+        self._send_cmd(script)
 
-        return voltages, currents
+        # Blocking wait: sweep + optional ramp time
+        import time as _time
+
+        est_step_time = max(delay, nplc / 50.0)
+        total_wait = max(0.1, est_step_time * points)
+        if ramp_up:
+            total_wait += max(0.1, abs(start_v) / max(ru_step, 1e-9) * ru_delay + 1)
+        if ramp_down:
+            total_wait += max(0.1, abs(stop_v) / max(rd_step, 1e-9) * rd_delay + 1)
+        _time.sleep(total_wait)
+
+        # Dynamic read: get buffer size then read sourcevalues and readings
+        n_pts = int(self._query_cmd(f"print({smu_channel}.nvbuffer1.n)"))
+        if n_pts < 1:
+            return [], []
+
+        reply_v = self._query_cmd(
+            f"printbuffer(1, {n_pts}, {smu_channel}.nvbuffer1.sourcevalues)"
+        )
+        reply_i = self._query_cmd(
+            f"printbuffer(1, {n_pts}, {smu_channel}.nvbuffer1.readings)"
+        )
+
+        def _parse_buffer(reply: str) -> list[float]:
+            parts = [p.strip() for p in reply.split(",") if p.strip()]
+            out: list[float] = []
+            for p in parts:
+                try:
+                    out.append(float(p))
+                except ValueError:
+                    continue
+            return out
+
+        voltages = _parse_buffer(reply_v)
+        currents = _parse_buffer(reply_i)
+        # Trim to same length (instrument may return slightly different counts)
+        n = min(len(voltages), len(currents), n_pts)
+        return voltages[:n], currents[:n]

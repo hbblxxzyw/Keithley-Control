@@ -3,15 +3,111 @@ Main controller: connects MainWindowUI and AbstractSMU, binds signals and slots.
 """
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QTableWidgetItem
 
 from core.instrument_base import AbstractSMU
 
 if TYPE_CHECKING:
     from ui.main_window_ui import MainWindowUI
+
+
+class SweepWorker(QThread):
+    """
+    Background worker thread to run sweeps without blocking the UI.
+
+    It receives an instrument instance plus a parameter dictionary and emits
+    data_ready for each acquired point and finished_sweep when done.
+    """
+
+    data_ready = Signal(float, float, str)
+    finished_sweep = Signal()
+
+    def __init__(
+        self,
+        instrument: AbstractSMU,
+        params: Dict[str, Any],
+        parent: "MainWindowUI | None" = None,
+    ) -> None:
+        super().__init__(parent)
+        self.instrument = instrument
+        self.params = params
+
+    def run(self) -> None:
+        p = self.params
+
+        primary_name: str = p["primary_name"]
+        stepper_name: str = p["stepper_name"]
+        primary_channel: str = p["primary_channel"]
+        stepper_channel: str = p["stepper_channel"]
+        pri_start: float = p["pri_start"]
+        pri_stop: float = p["pri_stop"]
+        pri_mode: str = p["pri_mode"]
+        stepper_level: float = p["stepper_level"]
+        stepper_limit: float = p["stepper_limit"]
+        stepper_start: float = p["stepper_start"]
+        stepper_stop: float = p["stepper_stop"]
+        stepper_mode: str = p["stepper_mode"]
+        points: int = p["points"]
+        stepper_points_assigned: int = p["stepper_points_assigned"]
+        src_meas_delay: float = p["src_meas_delay"]
+        nplc: float = p["nplc"]
+
+        delay_s = max(0.0, src_meas_delay)
+
+        try:
+            if stepper_mode == "fixed":
+                # ----- Branch A: Stepper Fixed → single sweep with bias -----
+                self.instrument.set_voltage_source(
+                    stepper_channel, stepper_level, stepper_limit
+                )
+                self.instrument.set_output(stepper_channel, True)
+
+                voltages, currents = self.instrument.run_iv_sweep(
+                    primary_channel, pri_start, pri_stop, points, delay_s, nplc
+                )
+                series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
+                for v, i_val in zip(voltages, currents):
+                    self.data_ready.emit(v, i_val, series_name)
+            else:
+                # ----- Branch B: Stepper Sweep → nested family of curves -----
+                n_stepper = max(1, int(stepper_points_assigned))
+                if n_stepper == 1:
+                    stepper_vals = np.array([float(stepper_start)])
+                else:
+                    stepper_vals = np.linspace(
+                        float(stepper_start),
+                        float(stepper_stop),
+                        n_stepper,
+                    )
+                for step_val in stepper_vals:
+                    self.instrument.set_voltage_source(
+                        stepper_channel, float(step_val), stepper_limit
+                    )
+                    self.instrument.set_output(stepper_channel, True)
+                    if delay_s > 0:
+                        time.sleep(delay_s)
+
+                    voltages, currents = self.instrument.run_iv_sweep(
+                        primary_channel, pri_start, pri_stop, points, delay_s, nplc
+                    )
+                    series_name = f"{primary_name} (Step={step_val:.2f}V)"
+                    for v, i_val in zip(voltages, currents):
+                        self.data_ready.emit(v, i_val, series_name)
+        finally:
+            # Ensure outputs are turned off and signal completion
+            try:
+                self.instrument.set_output("smua", False)
+            except Exception:
+                pass
+            try:
+                self.instrument.set_output("smub", False)
+            except Exception:
+                pass
+            self.finished_sweep.emit()
 
 
 class MainController:
@@ -50,11 +146,13 @@ class MainController:
             self.ui.connection_status_label.setStyleSheet(
                 "color: #2d7d2d; font-weight: bold;"
             )
+            self.ui.run_btn.setEnabled(True)
         else:
             self.ui.connection_status_label.setText("Failed")
             self.ui.connection_status_label.setStyleSheet(
                 "color: #b71c1c; font-weight: bold;"
             )
+            self.ui.run_btn.setEnabled(False)
 
     def update_preview_and_summary(self, *args: object) -> None:
         """
@@ -170,7 +268,8 @@ class MainController:
 
         # ----- Device Summary: SMU 1 -----
         mode1_display = mode1.capitalize() if mode1 else "—"
-        self.ui.smu1_mode_label.setText(f"{func1 or '—'} / {mode1_display}")
+        self.ui.smu1_function_label.setText(func1 or "—")
+        self.ui.smu1_mode_label.setText(mode1_display)
         if func1 == "Voltage":
             if mode1 == "fixed":
                 self.ui.smu1_source_label.setText(f"Bias Level: {level1:.4g} V")
@@ -189,21 +288,28 @@ class MainController:
                     f"{start1:.4g} - {stop1:.4g} A Step: {step1_str}"
                 )
             self.ui.smu1_limit_label.setText(f"{limit1:.4g} V")
-        # Points (sweep only, based on assigned base points)
-        if mode1 == "sweep" and pts1_base > 0:
-            pts1 = int(pts1_base)
-            pts1_effective = pts1 * 2 - 1 if dual1 else pts1
-            self.ui.smu1_points_label.setText(
-                str(pts1_effective) + (" (dual)" if dual1 else "")
-            )
-            self.ui.smu1_points_label.setVisible(True)
+
+        # Ramp summary (only meaningful in Voltage mode)
+        if func1 == "Voltage":
+            ramp_parts: list[str] = []
+            if self.ui.ramp_up_check_smu1.isChecked():
+                ramp_parts.append("Up")
+            if self.ui.ramp_down_check_smu1.isChecked():
+                ramp_parts.append("Down")
+            if ramp_parts:
+                ramp_text = " / ".join(ramp_parts) + " enabled"
+            else:
+                ramp_text = "Disabled"
+            self.ui.smu1_ramp_label.setText(ramp_text)
+            self.ui.smu1_ramp_label.setVisible(True)
         else:
-            self.ui.smu1_points_label.setVisible(mode1 == "sweep")
-            self.ui.smu1_points_label.setText("—")
+            self.ui.smu1_ramp_label.setText("—")
+            self.ui.smu1_ramp_label.setVisible(False)
 
         # ----- Device Summary: SMU 2 -----
         mode2_display = mode2.capitalize() if mode2 else "—"
-        self.ui.smu2_mode_label.setText(f"{func2 or '—'} / {mode2_display}")
+        self.ui.smu2_function_label.setText(func2 or "—")
+        self.ui.smu2_mode_label.setText(mode2_display)
         if func2 == "Voltage":
             if mode2 == "fixed":
                 self.ui.smu2_source_label.setText(f"Bias Level: {level2:.4g} V")
@@ -222,17 +328,23 @@ class MainController:
                     f"{start2:.4g} - {stop2:.4g} A Step: {step2_str}"
                 )
             self.ui.smu2_limit_label.setText(f"{limit2:.4g} V")
-        # Points (sweep only, based on assigned base points)
-        if mode2 == "sweep" and pts2_base > 0:
-            pts2 = int(pts2_base)
-            pts2_effective = pts2 * 2 - 1 if dual2 else pts2
-            self.ui.smu2_points_label.setText(
-                str(pts2_effective) + (" (dual)" if dual2 else "")
-            )
-            self.ui.smu2_points_label.setVisible(True)
+
+        # Ramp summary (only meaningful in Voltage mode)
+        if func2 == "Voltage":
+            ramp_parts2: list[str] = []
+            if self.ui.ramp_up_check_smu2.isChecked():
+                ramp_parts2.append("Up")
+            if self.ui.ramp_down_check_smu2.isChecked():
+                ramp_parts2.append("Down")
+            if ramp_parts2:
+                ramp_text2 = " / ".join(ramp_parts2) + " enabled"
+            else:
+                ramp_text2 = "Disabled"
+            self.ui.smu2_ramp_label.setText(ramp_text2)
+            self.ui.smu2_ramp_label.setVisible(True)
         else:
-            self.ui.smu2_points_label.setVisible(mode2 == "sweep")
-            self.ui.smu2_points_label.setText("—")
+            self.ui.smu2_ramp_label.setText("—")
+            self.ui.smu2_ramp_label.setVisible(False)
 
         # ----- Calculated total points (global) -----
         pri_actual_pts = int(pts1_base if stepper_text != "SMU 1" else pts2_base)
@@ -314,10 +426,15 @@ class MainController:
 
     def handle_run(self) -> None:
         """
-        Run sweep based on stepper_selector: Primary does the main IV sweep,
-        Stepper provides bias (Fixed) or staircase (Sweep). Supports single-sweep
-        with bias and nested family-of-curves.
+        Run sweep based on stepper_selector using a background worker thread.
+
+        Primary does the main IV sweep, Stepper provides bias (Fixed) or
+        staircase (Sweep). Worker handles all instrument I/O; this method only
+        reads UI state, prepares parameters and wires signals.
         """
+        self.ui.run_btn.setEnabled(False)
+        self.ui.abort_btn.setEnabled(True)
+
         # ----- Global sweep / stepper points -----
         sweep_points = int(self.ui.sweep_points_spin.value())
         stepper_points = int(self.ui.stepper_points_spin.value())
@@ -377,72 +494,82 @@ class MainController:
 
         points = max(2, int(primary_points)) if pri_mode == "sweep" else 2
 
-        # ----- Clear UI -----
+        # ----- Clear UI before starting -----
         self.ui.graph_plot_placeholder.clear_plot()
         self.ui.data_table.setRowCount(0)
 
-        delay_s = max(0.0, self.ui.src_meas_delay_spin.value())
+        # Additional timing / measurement parameters
+        src_meas_delay = float(self.ui.src_meas_delay_spin.value())
+        nplc = float(self.ui.nplc_spin.value())
 
-        try:
-            if stepper_mode == "fixed":
-                # ----- Branch A: Stepper Fixed → single sweep with bias -----
-                self.instrument.set_voltage_source(
-                    stepper_channel, stepper_level, stepper_limit
-                )
-                self.instrument.set_output(stepper_channel, True)
+        params: Dict[str, Any] = {
+            "primary_name": primary_name,
+            "stepper_name": stepper_name,
+            "primary_channel": primary_channel,
+            "stepper_channel": stepper_channel,
+            "pri_start": pri_start,
+            "pri_stop": pri_stop,
+            "pri_mode": pri_mode,
+            "stepper_level": stepper_level,
+            "stepper_limit": stepper_limit,
+            "stepper_start": stepper_start,
+            "stepper_stop": stepper_stop,
+            "stepper_mode": stepper_mode,
+            "primary_points": primary_points,
+            "points": points,
+            "stepper_points_assigned": stepper_points_assigned,
+            "src_meas_delay": src_meas_delay,
+            "nplc": nplc,
+        }
 
-                voltages, currents = self.instrument.run_iv_sweep(
-                    primary_channel, pri_start, pri_stop, points
-                )
-                series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
-                for i, (v, i_val) in enumerate(zip(voltages, currents)):
-                    self.ui.graph_plot_placeholder.append_data_point(
-                        v, i_val, series_name
-                    )
-                    row = self.ui.data_table.rowCount()
-                    self.ui.data_table.insertRow(row)
-                    self._fill_table_row(
-                        row, primary_name, v, i_val, stepper_name, stepper_level
-                    )
-            else:
-                # ----- Branch B: Stepper Sweep → nested family of curves -----
-                # Generate stepper values from global stepper_points setting
-                n_stepper = max(1, int(stepper_points_assigned))
-                if n_stepper == 1:
-                    stepper_vals = np.array([float(stepper_start)])
-                else:
-                    stepper_vals = np.linspace(
-                        float(stepper_start),
-                        float(stepper_stop),
-                        n_stepper,
-                    )
-                for step_val in stepper_vals:
-                    self.instrument.set_voltage_source(
-                        stepper_channel, float(step_val), stepper_limit
-                    )
-                    self.instrument.set_output(stepper_channel, True)
-                    if delay_s > 0:
-                        time.sleep(delay_s)
+        # Create and start worker thread
+        self.worker = SweepWorker(self.instrument, params, parent=self.ui)
+        self.worker.data_ready.connect(self.handle_new_data_point)
+        self.worker.finished_sweep.connect(self.handle_sweep_finished)
 
-                    voltages, currents = self.instrument.run_iv_sweep(
-                        primary_channel, pri_start, pri_stop, points
-                    )
-                    series_name = f"{primary_name} (Step={step_val:.2f}V)"
-                    for i, (v, i_val) in enumerate(zip(voltages, currents)):
-                        self.ui.graph_plot_placeholder.append_data_point(
-                            v, i_val, series_name
-                        )
-                        row = self.ui.data_table.rowCount()
-                        self.ui.data_table.insertRow(row)
-                        self._fill_table_row(
-                            row, primary_name, v, i_val, stepper_name, float(step_val)
-                        )
-            self.instrument.set_output("smua", False)
-            self.instrument.set_output("smub", False)
-        except Exception:
-            self.instrument.set_output("smua", False)
-            self.instrument.set_output("smub", False)
-            raise
+        self.worker.start()
+
+    def handle_new_data_point(
+        self, v: float, i_val: float, series_name: str
+    ) -> None:
+        """
+        Slot for SweepWorker.data_ready: update graph and table in the UI thread.
+        """
+        # Append to graph
+        self.ui.graph_plot_placeholder.append_data_point(v, i_val, series_name)
+
+        # Parse primary/stepper names and stepper voltage from series_name
+        # Expected formats:
+        #   "SMU 1 (Bias=1.23V)" or "SMU 1 (Step=0.50V)"
+        primary_name = series_name.split(" (", 1)[0].strip()
+        if primary_name == "SMU 1":
+            stepper_name = "SMU 2"
+        else:
+            stepper_name = "SMU 1"
+
+        stepper_v = 0.0
+        if "(" in series_name and "=" in series_name:
+            try:
+                inner = series_name.split("(", 1)[1].rstrip(")")
+                # inner like "Bias=1.23V" or "Step=0.50V"
+                val_part = inner.split("=", 1)[1]
+                # strip potential unit at the end
+                val_str = val_part.rstrip("V").strip()
+                stepper_v = float(val_str)
+            except Exception:
+                stepper_v = 0.0
+
+        # Insert into table
+        row = self.ui.data_table.rowCount()
+        self.ui.data_table.insertRow(row)
+        self._fill_table_row(
+            row, primary_name, v, i_val, stepper_name, stepper_v
+        )
+
+    def handle_sweep_finished(self) -> None:
+        """Restore Run/Abort button state after worker finishes."""
+        self.ui.run_btn.setEnabled(True)
+        self.ui.abort_btn.setEnabled(False)
 
     def _fill_table_row(
         self,
