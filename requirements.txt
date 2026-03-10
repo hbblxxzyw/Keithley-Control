@@ -1,0 +1,10 @@
+# Dependencies for Keithley 2636 SourceMeter control GUI
+# Python >=3.9 recommended
+
+PySide6>=6.8.0
+pyqtgraph>=0.14.0
+pyvisa>=1.15.0
+pyvisa-py>=0.7.0
+pyserial>=3.5
+numpy>=1.26.0,<3.0.0
+pandas>=2.2.0
