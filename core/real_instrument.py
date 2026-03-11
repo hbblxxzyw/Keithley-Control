@@ -68,8 +68,18 @@ class RealKeithley2636(AbstractSMU):
         try:
             self._resource = self._rm.open_resource(resource_str)
             self._resource.timeout = self.DEFAULT_TIMEOUT_MS
+
+            # 设置 TSP 协议必需的指令终止符
+            self._resource.read_termination = "\n"
+            self._resource.write_termination = "\n"
+
+            # 针对串口连接，强制匹配仪器的波特率
+            if "ASRL" in resource_str.upper() or "COM" in resource_str.upper():
+                self._resource.baud_rate = 57600
+
             return True
-        except Exception:
+        except Exception as e:
+            print(f"Connection error: {e}")
             return False
 
     def disconnect(self) -> None:
