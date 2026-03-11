@@ -190,7 +190,15 @@ end
             script += f"""
 safe_ramp({smu_channel}, 0.0, {rd_step}, {rd_delay}, {smu_channel}.nvbuffer1)
 """
-        self._send_cmd(script)
+        # 以匿名脚本模式加载多行 TSP 代码，避免 -285 语法错误
+        self._send_cmd("loadscript")
+        for line in script.strip().split("\n"):
+            if line.strip():  # 跳过空行
+                self._send_cmd(line.strip())
+        self._send_cmd("endscript")
+
+        # 指挥仪器立刻运行刚刚加载的脚本
+        self._send_cmd("script.anonymous.run()")
 
         # Blocking wait: sweep + optional ramp time
         import time as _time
