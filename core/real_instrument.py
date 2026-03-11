@@ -102,7 +102,7 @@ class RealKeithley2636(AbstractSMU):
         """Set the specified channel to voltage source mode and compliance."""
         self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
         self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
-        self._send_cmd(f"{smu_channel}.source.ilimit = {current_limit}")
+        self._send_cmd(f"{smu_channel}.source.limit = {current_limit}")
 
     def measure_current(self, smu_channel: str) -> float:
         """Single current measurement on the given channel; TSP uses print to return value."""
