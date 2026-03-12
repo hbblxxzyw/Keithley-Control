@@ -6,6 +6,7 @@ for all real and virtual instruments.
 """
 
 from abc import ABC, abstractmethod
+from typing import Generator
 
 
 class AbstractSMU(ABC):
@@ -93,9 +94,12 @@ class AbstractSMU(ABC):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> tuple[list[float], list[float]]:
+    ) -> Generator[tuple[list[float], list[float]], None, None]:
         """
         Run a linear voltage sweep (IV sweep) on the specified channel.
+
+        Yields chunks of (voltages, currents) for low-latency streaming;
+        callers can plot or process data incrementally.
 
         Args:
             smu_channel: Channel identifier, either 'smua' or 'smub'.
@@ -112,8 +116,8 @@ class AbstractSMU(ABC):
             rd_step: Ramp-down voltage step in V.
             rd_delay: Ramp-down step delay in s.
 
-        Returns:
-            Tuple (voltages, currents):
+        Yields:
+            Tuples (voltages, currents) for each chunk:
             - voltages: List of actual source voltages (may include ramp points).
             - currents: List of corresponding currents, same length as voltages.
         """

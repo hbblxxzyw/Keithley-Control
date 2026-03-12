@@ -66,12 +66,13 @@ class SweepWorker(QThread):
                 )
                 self.instrument.set_output(stepper_channel, True)
 
-                voltages, currents = self.instrument.run_iv_sweep(
-                    primary_channel, pri_start, pri_stop, points, delay_s, nplc
-                )
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
-                for v, i_val in zip(voltages, currents):
-                    self.data_ready.emit(v, i_val, series_name)
+                # Stream chunks from generator; emit each point for real-time plot
+                for v_chunk, i_chunk in self.instrument.run_iv_sweep(
+                    primary_channel, pri_start, pri_stop, points, delay_s, nplc
+                ):
+                    for v, i_val in zip(v_chunk, i_chunk):
+                        self.data_ready.emit(v, i_val, series_name)
             else:
                 # ----- Branch B: Stepper Sweep → nested family of curves -----
                 n_stepper = max(1, int(stepper_points_assigned))
@@ -91,12 +92,13 @@ class SweepWorker(QThread):
                     if delay_s > 0:
                         time.sleep(delay_s)
 
-                    voltages, currents = self.instrument.run_iv_sweep(
-                        primary_channel, pri_start, pri_stop, points, delay_s, nplc
-                    )
                     series_name = f"{primary_name} (Step={step_val:.2f}V)"
-                    for v, i_val in zip(voltages, currents):
-                        self.data_ready.emit(v, i_val, series_name)
+                    # Stream chunks from generator; emit each point for real-time plot
+                    for v_chunk, i_chunk in self.instrument.run_iv_sweep(
+                        primary_channel, pri_start, pri_stop, points, delay_s, nplc
+                    ):
+                        for v, i_val in zip(v_chunk, i_chunk):
+                            self.data_ready.emit(v, i_val, series_name)
         finally:
             # Ensure outputs are turned off and signal completion
             try:

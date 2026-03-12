@@ -5,6 +5,8 @@ Implements AbstractSMU with no physical I/O; connect always succeeds,
 measurements return fake data.
 """
 
+from collections.abc import Generator
+
 from core.instrument_base import AbstractSMU
 
 
@@ -50,11 +52,11 @@ class DummyKeithley2636(AbstractSMU):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> tuple[list[float], list[float]]:
-        """Return linear voltage sweep and fake currents."""
+    ) -> Generator[tuple[list[float], list[float]], None, None]:
+        """Yield one chunk of linear voltage sweep and fake currents."""
         if points < 1:
-            return [], []
+            return
         step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
         voltages = [start_v + i * step for i in range(points)]
         currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
-        return voltages, currents
+        yield voltages, currents

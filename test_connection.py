@@ -26,16 +26,20 @@ def main() -> None:
     # 这里的调用将触发我们刚才重构的 TSP 块状脚本下发
     print("Executing Sweep: 0V to 5V, 51 points, 0.01s delay, 1.0 NPLC...")
     
-    # 注意：这里的参数需要和你在 real_instrument.py 中新定义的 run_iv_sweep 签名一致
-    voltages, currents = smu.run_iv_sweep(
-        smu_channel="smua", 
-        start_v=0.0, 
-        stop_v=5.0, 
+    # run_iv_sweep 返回生成器，按块迭代合并得到完整 (voltages, currents)
+    voltages: list[float] = []
+    currents: list[float] = []
+    for v_chunk, i_chunk in smu.run_iv_sweep(
+        smu_channel="smua",
+        start_v=0.0,
+        stop_v=5.0,
         points=51,
-        delay=0.01,   # 源与测量之间的延迟
-        nplc=1.0      # 积分时间
-    )
-    
+        delay=0.01,
+        nplc=1.0,
+    ):
+        voltages.extend(v_chunk)
+        currents.extend(i_chunk)
+
     print(f"\n[Result] Sweep finished. Received {len(voltages)} voltage points and {len(currents)} current points.")
 
     print("\n========== 4. Disconnect ==========")

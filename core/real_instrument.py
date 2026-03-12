@@ -1,12 +1,19 @@
 """
 Real instrument driver module.
 
-Implements Keithley 2636 SourceMeter control via PyVISA using TSP commands.
+Implements Keithley 2636/2600B SourceMeter control via PyVISA using TSP commands.
 Supports a debug "dry run" mode that requires no physical connection.
+Uses the instrument's Trigger Model for high-speed hardware scanning and
+chunked data streaming.
 """
+
+import time
+import math
+from collections.abc import Generator
 
 from core.instrument_base import AbstractSMU
 import pyvisa
+
 
 
 class RealKeithley2636(AbstractSMU):
@@ -102,7 +109,7 @@ class RealKeithley2636(AbstractSMU):
         """Set the specified channel to voltage source mode and compliance."""
         self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
         self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
-        self._send_cmd(f"{smu_channel}.source.limit = {current_limit}")
+        self._send_cmd(f"{smu_channel}.source.limiti = {current_limit}")
 
     def measure_current(self, smu_channel: str) -> float:
         """Single current measurement on the given channel; TSP uses print to return value."""
@@ -123,105 +130,18 @@ class RealKeithley2636(AbstractSMU):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> tuple[list[float], list[float]]:
+    ) -> Generator[tuple[list[float], list[float]], None, None]:
         """
-        Run a linear voltage sweep by pushing a TSP script to the instrument.
+        Run a linear voltage sweep using the instrument's Trigger Model.
 
-        The script performs the sweep on the instrument side (optionally with
-        safe_ramp up/down), stores voltages and currents in nvbuffer1, then
-        we fetch the data dynamically by buffer length.
+        Ensures output is turned on before the sweep, configures hardware
+        trigger (source linearv + measure i), then polls the buffer every 50 ms
+        and yields incremental (voltages_chunk, currents_chunk) for low-latency
+        streaming. ramp_up/ramp_down are accepted for API compatibility but
+        are not used in the trigger-model path.
         """
         if points < 1:
-            return [], []
-
-        # Configure buffer: clear, enable source value collection, append mode
-        self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
-        self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
-        self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
-        self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
-
-        # Lua safe_ramp: ramps voltage with steps, measures at each step into buffer
-        safe_ramp_def = """
-function safe_ramp(channel, target_v, step_v, delay_s, buffer)
-    local current_v = channel.source.levelv
-    if current_v == nil then current_v = 0.0 end
-    local diff = target_v - current_v
-    local dir = 1
-    if diff < 0 then dir = -1 end
-    while math.abs(target_v - current_v) > step_v do
-        current_v = current_v + dir * step_v
-        channel.source.levelv = current_v
-        delay(delay_s)
-        channel.measure.i(buffer)
-    end
-    channel.source.levelv = target_v
-    delay(delay_s)
-    channel.measure.i(buffer)
-end
-"""
-        # Build main script: define safe_ramp, then optional ramp_up, sweep loop, optional ramp_down
-        script = safe_ramp_def + f"""
-local start_v = {start_v}
-local stop_v = {stop_v}
-local points = {points}
-local delay_s = {delay}
-local step_v
-if points <= 1 then
-    step_v = 0
-else
-    step_v = (stop_v - start_v) / (points - 1)
-end
-"""
-        if ramp_up:
-            script += f"""
-{smu_channel}.source.levelv = 0
-{smu_channel}.source.output = {smu_channel}.OUTPUT_ON
-safe_ramp({smu_channel}, start_v, {ru_step}, {ru_delay}, {smu_channel}.nvbuffer1)
-"""
-        script += f"""
-for i = 0, points - 1 do
-    local v = start_v + i * step_v
-    {smu_channel}.source.levelv = v
-    delay(delay_s)
-    {smu_channel}.measure.i({smu_channel}.nvbuffer1)
-end
-"""
-        if ramp_down:
-            script += f"""
-safe_ramp({smu_channel}, 0.0, {rd_step}, {rd_delay}, {smu_channel}.nvbuffer1)
-"""
-        # 以匿名脚本模式加载多行 TSP 代码，避免 -285 语法错误
-        self._send_cmd("loadscript")
-        for line in script.strip().split("\n"):
-            if line.strip():  # 跳过空行
-                self._send_cmd(line.strip())
-        self._send_cmd("endscript")
-
-        # 指挥仪器立刻运行刚刚加载的脚本
-        self._send_cmd("script.anonymous.run()")
-
-        # Blocking wait: sweep + optional ramp time
-        import time as _time
-
-        est_step_time = max(delay, nplc / 50.0)
-        total_wait = max(0.1, est_step_time * points)
-        if ramp_up:
-            total_wait += max(0.1, abs(start_v) / max(ru_step, 1e-9) * ru_delay + 1)
-        if ramp_down:
-            total_wait += max(0.1, abs(stop_v) / max(rd_step, 1e-9) * rd_delay + 1)
-        _time.sleep(total_wait)
-
-        # Dynamic read: get buffer size then read sourcevalues and readings
-        n_pts = int(self._query_cmd(f"print({smu_channel}.nvbuffer1.n)"))
-        if n_pts < 1:
-            return [], []
-
-        reply_v = self._query_cmd(
-            f"printbuffer(1, {n_pts}, {smu_channel}.nvbuffer1.sourcevalues)"
-        )
-        reply_i = self._query_cmd(
-            f"printbuffer(1, {n_pts}, {smu_channel}.nvbuffer1.readings)"
-        )
+            return
 
         def _parse_buffer(reply: str) -> list[float]:
             parts = [p.strip() for p in reply.split(",") if p.strip()]
@@ -233,8 +153,86 @@ safe_ramp({smu_channel}, 0.0, {rd_step}, {rd_delay}, {smu_channel}.nvbuffer1)
                     continue
             return out
 
-        voltages = _parse_buffer(reply_v)
-        currents = _parse_buffer(reply_i)
-        # Trim to same length (instrument may return slightly different counts)
-        n = min(len(voltages), len(currents), n_pts)
-        return voltages[:n], currents[:n]
+        # 1) Turn output ON before sweep 
+        self._send_cmd(f"{smu_channel}.source.output = {smu_channel}.OUTPUT_ON")
+
+        # 2) Buffer: clear, collect source values, append mode; set NPLC
+        self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
+        self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
+        self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
+        self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
+
+        # 3) Poll and yield incremental chunks (no fixed sleep)
+        old_n = 0
+
+        # 4) Execute trogger block for supporting ramp up and down
+        def _execute_trigger_block(v_start: float, v_stop: float, block_pts: int, block_delay: float):
+            """Execute a single continuous trigger block (for ramp up, main sweep, and ramp down) and stream data"""
+            nonlocal old_n
+            if block_pts < 1:
+                return
+
+            if self.debug:
+                time.sleep(0.1)
+                step_v = (v_stop - v_start) / (block_pts - 1) if block_pts > 1 else 0.0
+                v_chunk = [v_start + i * step_v for i in range(block_pts)]
+                i_chunk = [1.23e-6 + (v - v_start) * 1e-7 for v in v_chunk]
+                yield v_chunk, i_chunk
+                old_n += block_pts
+                return
+            # Set specific step delay (e.g. ru_delay, delay, rd_delay)
+            self._send_cmd(f"{smu_channel}.source.delay = {block_delay}")
+            
+            # Configure Trigger Model parameters
+            self._send_cmd(f"{smu_channel}.trigger.source.linearv({v_start}, {v_stop}, {block_pts})")
+            self._send_cmd(f"{smu_channel}.trigger.source.action = {smu_channel}.ENABLE")
+            self._send_cmd(f"{smu_channel}.trigger.measure.i({smu_channel}.nvbuffer1)")
+            self._send_cmd(f"{smu_channel}.trigger.measure.action = {smu_channel}.ENABLE")
+            self._send_cmd(f"{smu_channel}.trigger.count = {block_pts}")
+            self._send_cmd(f"{smu_channel}.trigger.source.stimulus = 0")
+            self._send_cmd(f"{smu_channel}.trigger.measure.stimulus = 0")
+            
+            # Start hardware scan
+            self._send_cmd(f"{smu_channel}.trigger.initiate()")
+
+            # poll and pull incremental data for this block
+            target_n = old_n + block_pts
+            import time
+            while old_n < target_n:
+                time.sleep(0.05)
+                current_n = int(
+                    float(self._query_cmd(f"print({smu_channel}.nvbuffer1.n)"))
+                )
+                if current_n <= old_n:
+                    continue
+                # Pull only new data: indices old_n+1 .. current_n (1-based in TSP)
+                reply_v = self._query_cmd(
+                    f"printbuffer({old_n + 1}, {current_n}, "
+                    f"{smu_channel}.nvbuffer1.sourcevalues)"
+                )
+                reply_i = self._query_cmd(
+                    f"printbuffer({old_n + 1}, {current_n}, "
+                    f"{smu_channel}.nvbuffer1.readings)"
+                )
+                v_chunk = _parse_buffer(reply_v)
+                i_chunk = _parse_buffer(reply_i)
+                n_chunk = min(len(v_chunk), len(i_chunk))
+                if n_chunk > 0:
+                    yield v_chunk[:n_chunk], i_chunk[:n_chunk]
+                old_n = current_n
+
+        # ================= Three steps sequentially execution =================
+
+        # Step A：Ramp Up
+        if ramp_up and abs(start_v) > 0:
+            # Calculate safe points based on ru_step (round up to ensure actual step <= ru_step)
+            ru_pts = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
+            yield from _execute_trigger_block(0.0, start_v, ru_pts, ru_delay)
+
+        # Step B：Main Sweep
+        yield from _execute_trigger_block(start_v, stop_v, points, delay)
+
+        # Step C：Ramp Down
+        if ramp_down and abs(stop_v) > 0:
+            rd_pts = max(2, int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1)
+            yield from _execute_trigger_block(stop_v, 0.0, rd_pts, rd_delay)
