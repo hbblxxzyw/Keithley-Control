@@ -46,6 +46,7 @@ class DummyKeithley2636(AbstractSMU):
         points: int,
         delay: float = 0.0,
         nplc: float = 1.0,
+        current_limit: float | None = None,
         ramp_up: bool = False,
         ru_step: float = 0.5,
         ru_delay: float = 0.1,

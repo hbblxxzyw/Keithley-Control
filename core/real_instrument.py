@@ -27,6 +27,8 @@ class RealKeithley2636(AbstractSMU):
 
     # Connection timeout in milliseconds
     DEFAULT_TIMEOUT_MS = 10000
+    DEFAULT_POLL_INTERVAL_S = 0.1
+    MIN_CHUNK_POINTS = 5
 
     def __init__(self, debug: bool = False) -> None:
         """
@@ -37,6 +39,7 @@ class RealKeithley2636(AbstractSMU):
         self.debug = debug
         self._rm = pyvisa.ResourceManager()
         self._resource = None
+        self._current_limits: dict[str, float] = {}
 
     def _send_cmd(self, cmd: str) -> None:
         """
@@ -110,6 +113,8 @@ class RealKeithley2636(AbstractSMU):
         self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
         self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
         self._send_cmd(f"{smu_channel}.source.limiti = {current_limit}")
+        if current_limit > 0:
+            self._current_limits[smu_channel] = float(current_limit)
 
     def measure_current(self, smu_channel: str) -> float:
         """Single current measurement on the given channel; TSP uses print to return value."""
@@ -124,6 +129,7 @@ class RealKeithley2636(AbstractSMU):
         points: int,
         delay: float = 0.0,
         nplc: float = 1.0,
+        current_limit: float | None = None,
         ramp_up: bool = False,
         ru_step: float = 0.5,
         ru_delay: float = 0.1,
@@ -143,6 +149,10 @@ class RealKeithley2636(AbstractSMU):
         if points < 1:
             return
 
+        sweep_current_limit = current_limit
+        if sweep_current_limit is None:
+            sweep_current_limit = self._current_limits.get(smu_channel)
+
         def _parse_buffer(reply: str) -> list[float]:
             parts = [p.strip() for p in reply.split(",") if p.strip()]
             out: list[float] = []
@@ -153,14 +163,44 @@ class RealKeithley2636(AbstractSMU):
                     continue
             return out
 
+        def _linear_chunk_values(
+            v_start: float,
+            v_stop: float,
+            total_points: int,
+            start_point: int,
+            end_point: int,
+        ) -> list[float]:
+            if total_points <= 1:
+                return [v_start]
+            step_v = (v_stop - v_start) / (total_points - 1)
+            return [v_start + (idx - 1) * step_v for idx in range(start_point, end_point + 1)]
+
+        def _configure_fast_measurement(limit_amps: float | None) -> None:
+            self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
+            self._send_cmd(
+                f"{smu_channel}.measure.autozero = {smu_channel}.AUTOZERO_OFF"
+            )
+            self._send_cmd(
+                f"{smu_channel}.measure.filter.enable = {smu_channel}.FILTER_OFF"
+            )
+            if limit_amps is not None and limit_amps > 0:
+                self._send_cmd(
+                    f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF"
+                )
+                self._send_cmd(f"{smu_channel}.measure.rangei = {abs(limit_amps)}")
+            else:
+                self._send_cmd(
+                    f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON"
+                )
+
         # 1) Turn output ON before sweep 
         self._send_cmd(f"{smu_channel}.source.output = {smu_channel}.OUTPUT_ON")
 
-        # 2) Buffer: clear, collect source values, append mode; set NPLC
+        # 2) Buffer: clear, collect source values, append mode; set fast measurement mode
         self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
         self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
         self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
-        self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
+        _configure_fast_measurement(sweep_current_limit)
 
         # 3) Poll and yield incremental chunks (no fixed sleep)
         old_n = 0
@@ -196,26 +236,35 @@ class RealKeithley2636(AbstractSMU):
             self._send_cmd(f"{smu_channel}.trigger.initiate()")
 
             # poll and pull incremental data for this block
+            block_base_n = old_n
             target_n = old_n + block_pts
-            import time
             while old_n < target_n:
-                time.sleep(0.05)
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
                 current_n = int(
                     float(self._query_cmd(f"print({smu_channel}.nvbuffer1.n)"))
                 )
                 if current_n <= old_n:
                     continue
+                if (
+                    current_n < target_n
+                    and current_n - old_n < self.MIN_CHUNK_POINTS
+                ):
+                    continue
                 # Pull only new data: indices old_n+1 .. current_n (1-based in TSP)
-                reply_v = self._query_cmd(
-                    f"printbuffer({old_n + 1}, {current_n}, "
-                    f"{smu_channel}.nvbuffer1.sourcevalues)"
-                )
                 reply_i = self._query_cmd(
                     f"printbuffer({old_n + 1}, {current_n}, "
                     f"{smu_channel}.nvbuffer1.readings)"
                 )
-                v_chunk = _parse_buffer(reply_v)
                 i_chunk = _parse_buffer(reply_i)
+                start_point = old_n - block_base_n + 1
+                end_point = current_n - block_base_n
+                v_chunk = _linear_chunk_values(
+                    v_start,
+                    v_stop,
+                    block_pts,
+                    start_point,
+                    end_point,
+                )
                 n_chunk = min(len(v_chunk), len(i_chunk))
                 if n_chunk > 0:
                     yield v_chunk[:n_chunk], i_chunk[:n_chunk]

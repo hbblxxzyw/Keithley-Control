@@ -88,6 +88,7 @@ class AbstractSMU(ABC):
         points: int,
         delay: float = 0.0,
         nplc: float = 1.0,
+        current_limit: float | None = None,
         ramp_up: bool = False,
         ru_step: float = 0.5,
         ru_delay: float = 0.1,
@@ -109,6 +110,8 @@ class AbstractSMU(ABC):
                 is linearly spaced between start_v and stop_v.
             delay: Source-to-measure delay in seconds for each step.
             nplc: Integration time in PLC (power-line cycles) per measurement.
+            current_limit: Optional current compliance/range hint in A for
+                configuring a fixed current measurement range during the sweep.
             ramp_up: If True, ramp from 0 V to start_v before the sweep.
             ru_step: Ramp-up voltage step in V.
             ru_delay: Ramp-up step delay in s.

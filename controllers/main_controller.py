@@ -46,6 +46,7 @@ class SweepWorker(QThread):
         pri_start: float = p["pri_start"]
         pri_stop: float = p["pri_stop"]
         pri_mode: str = p["pri_mode"]
+        primary_limit: float = p["primary_limit"]
         stepper_level: float = p["stepper_level"]
         stepper_limit: float = p["stepper_limit"]
         stepper_start: float = p["stepper_start"]
@@ -69,7 +70,13 @@ class SweepWorker(QThread):
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
                 # Stream chunks from generator; emit each point for real-time plot
                 for v_chunk, i_chunk in self.instrument.run_iv_sweep(
-                    primary_channel, pri_start, pri_stop, points, delay_s, nplc
+                    primary_channel,
+                    pri_start,
+                    pri_stop,
+                    points,
+                    delay_s,
+                    nplc,
+                    primary_limit,
                 ):
                     for v, i_val in zip(v_chunk, i_chunk):
                         self.data_ready.emit(v, i_val, series_name)
@@ -95,7 +102,13 @@ class SweepWorker(QThread):
                     series_name = f"{primary_name} (Step={step_val:.2f}V)"
                     # Stream chunks from generator; emit each point for real-time plot
                     for v_chunk, i_chunk in self.instrument.run_iv_sweep(
-                        primary_channel, pri_start, pri_stop, points, delay_s, nplc
+                        primary_channel,
+                        pri_start,
+                        pri_stop,
+                        points,
+                        delay_s,
+                        nplc,
+                        primary_limit,
                     ):
                         for v, i_val in zip(v_chunk, i_chunk):
                             self.data_ready.emit(v, i_val, series_name)
@@ -454,6 +467,7 @@ class MainController:
             stepper_channel = "smub"
             pri_start = self.ui.start_spin_smu1.value()
             pri_stop = self.ui.stop_spin_smu1.value()
+            primary_limit = self.ui.limit_spin_smu1.value()
             pri_mode = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
             stepper_level = self.ui.level_spin_smu2.value()
             stepper_limit = self.ui.limit_spin_smu2.value()
@@ -469,6 +483,7 @@ class MainController:
             stepper_channel = "smua"
             pri_start = self.ui.start_spin_smu2.value()
             pri_stop = self.ui.stop_spin_smu2.value()
+            primary_limit = self.ui.limit_spin_smu2.value()
             pri_mode = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
             stepper_level = self.ui.level_spin_smu1.value()
             stepper_limit = self.ui.limit_spin_smu1.value()
@@ -485,6 +500,7 @@ class MainController:
             stepper_channel = "smub"
             pri_start = self.ui.start_spin_smu1.value()
             pri_stop = self.ui.stop_spin_smu1.value()
+            primary_limit = self.ui.limit_spin_smu1.value()
             pri_mode = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
             stepper_level = self.ui.level_spin_smu2.value()
             stepper_limit = self.ui.limit_spin_smu2.value()
@@ -512,6 +528,7 @@ class MainController:
             "pri_start": pri_start,
             "pri_stop": pri_stop,
             "pri_mode": pri_mode,
+            "primary_limit": primary_limit,
             "stepper_level": stepper_level,
             "stepper_limit": stepper_limit,
             "stepper_start": stepper_start,
