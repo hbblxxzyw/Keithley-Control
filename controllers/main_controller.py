@@ -40,12 +40,10 @@ class SweepWorker(QThread):
         p = self.params
 
         primary_name: str = p["primary_name"]
-        stepper_name: str = p["stepper_name"]
         primary_channel: str = p["primary_channel"]
         stepper_channel: str = p["stepper_channel"]
         pri_start: float = p["pri_start"]
         pri_stop: float = p["pri_stop"]
-        pri_mode: str = p["pri_mode"]
         primary_limit: float = p["primary_limit"]
         stepper_level: float = p["stepper_level"]
         stepper_limit: float = p["stepper_limit"]
@@ -56,8 +54,64 @@ class SweepWorker(QThread):
         stepper_points_assigned: int = p["stepper_points_assigned"]
         src_meas_delay: float = p["src_meas_delay"]
         nplc: float = p["nplc"]
+        primary_dual: bool = p["primary_dual"]
+        stepper_dual: bool = p["stepper_dual"]
+        ramp_up: bool = p["ramp_up"]
+        ru_step: float = p["ru_step"]
+        ru_delay: float = p["ru_delay"]
+        ramp_down: bool = p["ramp_down"]
+        rd_step: float = p["rd_step"]
+        rd_delay: float = p["rd_delay"]
 
         delay_s = max(0.0, src_meas_delay)
+
+        def emit_iv_sweep(
+            sweep_start: float,
+            sweep_stop: float,
+            sweep_points: int,
+            use_ramp_up: bool,
+            use_ramp_down: bool,
+            series_name: str,
+        ) -> None:
+            for v_chunk, i_chunk in self.instrument.run_iv_sweep(
+                primary_channel,
+                sweep_start,
+                sweep_stop,
+                sweep_points,
+                delay_s,
+                nplc,
+                primary_limit,
+                use_ramp_up,
+                ru_step,
+                ru_delay,
+                use_ramp_down,
+                rd_step,
+                rd_delay,
+            ):
+                for v, i_val in zip(v_chunk, i_chunk):
+                    self.data_ready.emit(v, i_val, series_name)
+
+        def run_primary_sweep(series_name: str) -> None:
+            emit_iv_sweep(
+                pri_start,
+                pri_stop,
+                points,
+                ramp_up,
+                False if primary_dual else ramp_down,
+                series_name,
+            )
+
+            if primary_dual and points > 1:
+                step_v = (pri_stop - pri_start) / float(points - 1)
+                reverse_start = pri_stop - step_v
+                emit_iv_sweep(
+                    reverse_start,
+                    pri_start,
+                    points - 1,
+                    False,
+                    ramp_down,
+                    series_name,
+                )
 
         try:
             if stepper_mode == "fixed":
@@ -68,18 +122,7 @@ class SweepWorker(QThread):
                 self.instrument.set_output(stepper_channel, True)
 
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
-                # Stream chunks from generator; emit each point for real-time plot
-                for v_chunk, i_chunk in self.instrument.run_iv_sweep(
-                    primary_channel,
-                    pri_start,
-                    pri_stop,
-                    points,
-                    delay_s,
-                    nplc,
-                    primary_limit,
-                ):
-                    for v, i_val in zip(v_chunk, i_chunk):
-                        self.data_ready.emit(v, i_val, series_name)
+                run_primary_sweep(series_name)
             else:
                 # ----- Branch B: Stepper Sweep → nested family of curves -----
                 n_stepper = max(1, int(stepper_points_assigned))
@@ -91,6 +134,10 @@ class SweepWorker(QThread):
                         float(stepper_stop),
                         n_stepper,
                     )
+                    if stepper_dual:
+                        stepper_vals = np.concatenate(
+                            (stepper_vals, stepper_vals[-2::-1])
+                        )
                 for step_val in stepper_vals:
                     self.instrument.set_voltage_source(
                         stepper_channel, float(step_val), stepper_limit
@@ -100,18 +147,7 @@ class SweepWorker(QThread):
                         time.sleep(delay_s)
 
                     series_name = f"{primary_name} (Step={step_val:.2f}V)"
-                    # Stream chunks from generator; emit each point for real-time plot
-                    for v_chunk, i_chunk in self.instrument.run_iv_sweep(
-                        primary_channel,
-                        pri_start,
-                        pri_stop,
-                        points,
-                        delay_s,
-                        nplc,
-                        primary_limit,
-                    ):
-                        for v, i_val in zip(v_chunk, i_chunk):
-                            self.data_ready.emit(v, i_val, series_name)
+                    run_primary_sweep(series_name)
         finally:
             # Ensure outputs are turned off and signal completion
             try:
@@ -476,6 +512,14 @@ class MainController:
             stepper_mode = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
             primary_points = sweep_points
             stepper_points_assigned = stepper_points
+            primary_dual = self.ui.dual_sweep_check_smu1.isChecked()
+            stepper_dual = self.ui.dual_sweep_check_smu2.isChecked()
+            ramp_up = self.ui.ramp_up_check_smu1.isChecked()
+            ru_step = float(self.ui.ramp_up_step_smu1.value())
+            ru_delay = float(self.ui.ramp_up_delay_smu1.value())
+            ramp_down = self.ui.ramp_down_check_smu1.isChecked()
+            rd_step = float(self.ui.ramp_down_step_smu1.value())
+            rd_delay = float(self.ui.ramp_down_delay_smu1.value())
         elif stepper_text == "SMU 1":
             primary_name = "SMU 2"
             stepper_name = "SMU 1"
@@ -492,6 +536,14 @@ class MainController:
             stepper_mode = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
             primary_points = sweep_points
             stepper_points_assigned = stepper_points
+            primary_dual = self.ui.dual_sweep_check_smu2.isChecked()
+            stepper_dual = self.ui.dual_sweep_check_smu1.isChecked()
+            ramp_up = self.ui.ramp_up_check_smu2.isChecked()
+            ru_step = float(self.ui.ramp_up_step_smu2.value())
+            ru_delay = float(self.ui.ramp_up_delay_smu2.value())
+            ramp_down = self.ui.ramp_down_check_smu2.isChecked()
+            rd_step = float(self.ui.ramp_down_step_smu2.value())
+            rd_delay = float(self.ui.ramp_down_delay_smu2.value())
         else:
             # Fallback: no stepper, SMU1 primary
             primary_name = "SMU 1"
@@ -509,6 +561,14 @@ class MainController:
             stepper_mode = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
             primary_points = sweep_points
             stepper_points_assigned = 0
+            primary_dual = self.ui.dual_sweep_check_smu1.isChecked()
+            stepper_dual = False
+            ramp_up = self.ui.ramp_up_check_smu1.isChecked()
+            ru_step = float(self.ui.ramp_up_step_smu1.value())
+            ru_delay = float(self.ui.ramp_up_delay_smu1.value())
+            ramp_down = self.ui.ramp_down_check_smu1.isChecked()
+            rd_step = float(self.ui.ramp_down_step_smu1.value())
+            rd_delay = float(self.ui.ramp_down_delay_smu1.value())
 
         points = max(2, int(primary_points)) if pri_mode == "sweep" else 2
 
@@ -539,6 +599,14 @@ class MainController:
             "stepper_points_assigned": stepper_points_assigned,
             "src_meas_delay": src_meas_delay,
             "nplc": nplc,
+            "primary_dual": primary_dual,
+            "stepper_dual": stepper_dual,
+            "ramp_up": ramp_up,
+            "ru_step": ru_step,
+            "ru_delay": ru_delay,
+            "ramp_down": ramp_down,
+            "rd_step": rd_step,
+            "rd_delay": rd_delay,
         }
 
         # Create and start worker thread

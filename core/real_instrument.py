@@ -143,8 +143,8 @@ class RealKeithley2636(AbstractSMU):
         Ensures output is turned on before the sweep, configures hardware
         trigger (source linearv + measure i), then polls the buffer every 50 ms
         and yields incremental (voltages_chunk, currents_chunk) for low-latency
-        streaming. ramp_up/ramp_down are accepted for API compatibility but
-        are not used in the trigger-model path.
+        streaming. If enabled, ramp-up and ramp-down are executed as separate
+        trigger blocks before and after the main sweep.
         """
         if points < 1:
             return
@@ -193,19 +193,24 @@ class RealKeithley2636(AbstractSMU):
                     f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON"
                 )
 
-        # 1) Turn output ON before sweep 
+        # 1) Force the sweep channel to a known 0 V state before enabling output.
+        self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
+        if sweep_current_limit is not None:
+            self._send_cmd(f"{smu_channel}.source.limiti = {sweep_current_limit}")
+        self._send_cmd(f"{smu_channel}.source.levelv = 0")
+        # 2) Turn output ON before sweep
         self._send_cmd(f"{smu_channel}.source.output = {smu_channel}.OUTPUT_ON")
 
-        # 2) Buffer: clear, collect source values, append mode; set fast measurement mode
+        # 3) Buffer: clear, collect source values, append mode; set fast measurement mode
         self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
         self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
         self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
         _configure_fast_measurement(sweep_current_limit)
 
-        # 3) Poll and yield incremental chunks (no fixed sleep)
+        # 4) Poll and yield incremental chunks (no fixed sleep)
         old_n = 0
 
-        # 4) Execute trogger block for supporting ramp up and down
+        # 5) Execute trigger blocks for ramp up, main sweep, and ramp down.
         def _execute_trigger_block(v_start: float, v_stop: float, block_pts: int, block_delay: float):
             """Execute a single continuous trigger block (for ramp up, main sweep, and ramp down) and stream data"""
             nonlocal old_n
