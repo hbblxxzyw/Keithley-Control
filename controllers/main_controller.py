@@ -92,6 +92,50 @@ class SweepWorker(QThread):
                 values_per_point.append(point_values)
             return values_per_point
 
+        def build_linear_points(start: float, stop: float, count: int) -> list[float]:
+            if count <= 0:
+                return []
+            if count == 1:
+                return [float(start)]
+            return np.linspace(float(start), float(stop), int(count)).tolist()
+
+        def build_ramp_points(start: float, stop: float, step_size: float) -> list[float]:
+            distance = abs(float(stop) - float(start))
+            safe_step = max(float(step_size), 1e-9)
+            count = max(2, int(np.ceil(distance / safe_step)) + 1)
+            return build_linear_points(start, stop, count)
+
+        def extend_without_duplicate(base: list[float], extra: list[float]) -> None:
+            if not extra:
+                return
+            if base and abs(base[-1] - extra[0]) < 1e-12:
+                base.extend(extra[1:])
+            else:
+                base.extend(extra)
+
+        def build_primary_sequence(
+            sweep_start: float,
+            sweep_stop: float,
+            sweep_points: int,
+            use_ramp_up: bool,
+            use_ramp_down: bool,
+        ) -> list[float]:
+            main_points = build_linear_points(sweep_start, sweep_stop, sweep_points)
+            sequence: list[float] = []
+            if use_ramp_up and abs(sweep_start) > 0:
+                extend_without_duplicate(
+                    sequence,
+                    build_ramp_points(0.0, sweep_start, ru_step),
+                )
+            extend_without_duplicate(sequence, main_points)
+            end_value = sequence[-1] if sequence else sweep_stop
+            if use_ramp_down and abs(end_value) > 0:
+                extend_without_duplicate(
+                    sequence,
+                    build_ramp_points(end_value, 0.0, rd_step),
+                )
+            return sequence
+
         def secondary_channel_name() -> str:
             return "smub" if primary_channel == "smua" else "smua"
 
@@ -133,9 +177,12 @@ class SweepWorker(QThread):
             stepper_setpoint: float,
             source_values: list[float],
             current_values: list[float],
-        ) -> None:
+        ) -> int:
             primary_points = build_primary_values(source_values, current_values)
-            secondary_chunk_values = measure_secondary_chunk()
+            try:
+                secondary_chunk_values = measure_secondary_chunk()
+            except Exception:
+                secondary_chunk_values = {}
             for source_value, primary_values in zip(source_values, primary_points):
                 payload = build_payload(
                     started_at,
@@ -146,6 +193,33 @@ class SweepWorker(QThread):
                     dict(secondary_chunk_values),
                 )
                 self.data_ready.emit(payload)
+            return min(len(source_values), len(primary_points))
+
+        def emit_point_measurement(
+            started_at: float,
+            series_name: str,
+            primary_setpoint: float,
+            stepper_setpoint: float,
+        ) -> None:
+            primary_values = self.instrument.measure_selected(
+                primary_channel,
+                list(measure_cfg[primary_channel]["items"]),
+            )
+            primary_values.setdefault("Voltage", float(primary_setpoint))
+            try:
+                secondary_values = measure_secondary_chunk()
+            except Exception:
+                secondary_values = {}
+            self.data_ready.emit(
+                build_payload(
+                    started_at,
+                    series_name,
+                    primary_setpoint,
+                    stepper_setpoint,
+                    primary_values,
+                    secondary_values,
+                )
+            )
 
         def stream_iv_pass(
             started_at: float,
@@ -156,7 +230,8 @@ class SweepWorker(QThread):
             sweep_points: int,
             use_ramp_up: bool,
             use_ramp_down: bool,
-        ) -> None:
+        ) -> int:
+            emitted_points = 0
             for source_chunk, current_chunk in self.instrument.run_iv_sweep(
                 primary_channel,
                 sweep_start,
@@ -172,40 +247,102 @@ class SweepWorker(QThread):
                 rd_step,
                 rd_delay,
             ):
-                emit_chunk_payloads(
+                emitted_points += emit_chunk_payloads(
                     started_at,
                     series_name,
                     stepper_setpoint,
                     list(source_chunk),
                     list(current_chunk),
                 )
+            return emitted_points
+
+        def run_primary_sweep_fallback(
+            series_name: str,
+            stepper_setpoint: float,
+            sweep_start: float,
+            sweep_stop: float,
+            sweep_points: int,
+            use_ramp_up: bool,
+            use_ramp_down: bool,
+        ) -> None:
+            started_at = time.monotonic()
+            self.instrument.set_voltage_source(primary_channel, sweep_start, primary_limit)
+            self.instrument.set_output(primary_channel, True)
+            sequence = build_primary_sequence(
+                sweep_start,
+                sweep_stop,
+                sweep_points,
+                use_ramp_up,
+                use_ramp_down,
+            )
+            for value in sequence:
+                self.instrument.set_voltage_source(
+                    primary_channel,
+                    float(value),
+                    primary_limit,
+                )
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                emit_point_measurement(
+                    started_at,
+                    series_name,
+                    float(value),
+                    float(stepper_setpoint),
+                )
 
         def run_primary_sweep(series_name: str, stepper_setpoint: float) -> None:
             started_at = time.monotonic()
-            stream_iv_pass(
-                started_at,
-                series_name,
-                stepper_setpoint,
-                pri_start,
-                pri_stop,
-                points,
-                ramp_up,
-                False if primary_dual else ramp_down,
-            )
-
-            if primary_dual and points > 1:
-                step_v = (pri_stop - pri_start) / float(points - 1)
-                reverse_start = pri_stop - step_v
-                stream_iv_pass(
+            chunk_failed = False
+            emitted_total = 0
+            try:
+                emitted_total += stream_iv_pass(
                     started_at,
                     series_name,
                     stepper_setpoint,
-                    reverse_start,
                     pri_start,
-                    points - 1,
-                    False,
-                    ramp_down,
+                    pri_stop,
+                    points,
+                    ramp_up,
+                    False if primary_dual else ramp_down,
                 )
+                if primary_dual and points > 1:
+                    step_v = (pri_stop - pri_start) / float(points - 1)
+                    reverse_start = pri_stop - step_v
+                    emitted_total += stream_iv_pass(
+                        started_at,
+                        series_name,
+                        stepper_setpoint,
+                        reverse_start,
+                        pri_start,
+                        points - 1,
+                        False,
+                        ramp_down,
+                    )
+            except Exception:
+                chunk_failed = True
+
+            if chunk_failed or emitted_total == 0:
+                run_primary_sweep_fallback(
+                    series_name,
+                    stepper_setpoint,
+                    pri_start,
+                    pri_stop,
+                    points,
+                    ramp_up,
+                    False if primary_dual else ramp_down,
+                )
+                if primary_dual and points > 1:
+                    step_v = (pri_stop - pri_start) / float(points - 1)
+                    reverse_start = pri_stop - step_v
+                    run_primary_sweep_fallback(
+                        series_name,
+                        stepper_setpoint,
+                        reverse_start,
+                        pri_start,
+                        points - 1,
+                        False,
+                        ramp_down,
+                    )
 
         try:
             for channel in ("smua", "smub"):
