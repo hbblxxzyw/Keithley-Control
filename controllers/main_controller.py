@@ -2,6 +2,7 @@
 Main controller: connects MainWindowUI and AbstractSMU, binds signals and slots.
 """
 
+import csv
 import json
 import time
 from typing import TYPE_CHECKING, Any, Dict
@@ -249,6 +250,7 @@ class MainController:
         self.ui.reset_config_btn.clicked.connect(self.handle_reset_config)
         self.ui.run_btn.clicked.connect(self.handle_run)
         self.ui.clear_plot_btn.clicked.connect(self.handle_clear_plot)
+        self.ui.export_csv_btn.clicked.connect(self.handle_export_csv)
         self.ui.channel_config_changed.connect(self.update_preview_and_summary)
         self.ui.smu_selector.currentIndexChanged.connect(self.update_preview_and_summary)
 
@@ -352,6 +354,45 @@ class MainController:
     def handle_reset_config(self) -> None:
         """Restore the UI to its default settings."""
         self.ui.reset_settings()
+
+    def handle_export_csv(self) -> None:
+        """Export the Table tab contents to CSV."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.ui,
+            "Export Table to CSV",
+            "keithley_measurements.csv",
+            "CSV Files (*.csv)",
+        )
+        if not file_path:
+            return
+
+        try:
+            headers = [
+                self.ui.data_table.horizontalHeaderItem(col).text()
+                for col in range(self.ui.data_table.columnCount())
+            ]
+            with open(file_path, "w", encoding="utf-8-sig", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                for row in range(self.ui.data_table.rowCount()):
+                    values: list[str] = []
+                    for col in range(self.ui.data_table.columnCount()):
+                        item = self.ui.data_table.item(row, col)
+                        values.append("" if item is None else item.text())
+                    writer.writerow(values)
+        except Exception as exc:
+            QMessageBox.critical(
+                self.ui,
+                "Export Failed",
+                f"Could not export CSV.\n{exc}",
+            )
+            return
+
+        QMessageBox.information(
+            self.ui,
+            "Export Complete",
+            f"CSV saved to:\n{file_path}",
+        )
 
     def update_preview_and_summary(self, *args: object) -> None:
         """
@@ -833,15 +874,17 @@ class MainController:
 
         if "Voltage" in smu1_values and "Current" in smu1_values:
             self.ui.graph_plot_placeholder.append_data_point(
+                "SMU 1",
                 float(smu1_values["Voltage"]),
                 float(smu1_values["Current"]),
-                f"SMU 1 | {series_name}",
+                series_name,
             )
         if "Voltage" in smu2_values and "Current" in smu2_values:
             self.ui.graph_plot_placeholder.append_data_point(
+                "SMU 2",
                 float(smu2_values["Voltage"]),
                 float(smu2_values["Current"]),
-                f"SMU 2 | {series_name}",
+                series_name,
             )
 
         row = self.ui.data_table.rowCount()

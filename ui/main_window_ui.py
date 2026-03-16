@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QTabWidget,
     QStackedWidget,
+    QScrollArea,
     QVBoxLayout,
     QHBoxLayout,
     QFormLayout,
@@ -475,8 +476,14 @@ class MainWindowUI(QMainWindow):
         self.channel_stacked = QStackedWidget()
         self.channel_stacked.addWidget(self._build_smu_form_page(1))
         self.channel_stacked.addWidget(self._build_smu_form_page(2))
+
+        self.channel_scroll = QScrollArea()
+        self.channel_scroll.setWidgetResizable(True)
+        self.channel_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.channel_scroll.setWidget(self.channel_stacked)
+
         self.smu_selector.currentIndexChanged.connect(self.channel_stacked.setCurrentIndex)
-        channel_layout.addWidget(self.channel_stacked)
+        channel_layout.addWidget(self.channel_scroll)
         lower_layout.addWidget(channel_group, 1)
 
         # --- Right: Common Settings ---
@@ -647,7 +654,7 @@ class MainWindowUI(QMainWindow):
         ramp_down_check.stateChanged.connect(update_ramp_visibility)
         update_ramp_visibility()
 
-        form.addRow("", ramp_container)
+        form.addRow("Ramp:", ramp_container)
 
         level_spin = QDoubleSpinBox()
         level_spin.setRange(-1e3, 1e3)

@@ -9,6 +9,7 @@ chunked data streaming.
 
 import time
 import math
+import re
 from collections.abc import Generator
 
 from core.instrument_base import AbstractSMU
@@ -29,6 +30,7 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_TIMEOUT_MS = 10000
     DEFAULT_POLL_INTERVAL_S = 0.1
     MIN_CHUNK_POINTS = 5
+    MEASURE_EVERY_N_POINTS = 3
 
     def __init__(self, debug: bool = False) -> None:
         """
@@ -41,6 +43,9 @@ class RealKeithley2636(AbstractSMU):
         self._resource = None
         self._current_limits: dict[str, float] = {}
         self._source_levels: dict[str, float] = {"smua": 0.0, "smub": 0.0}
+        self._source_limits: dict[str, float | None] = {"smua": None, "smub": None}
+        self._source_modes: dict[str, str] = {}
+        self._measure_state: dict[str, dict[str, object]] = {}
 
     def _send_cmd(self, cmd: str) -> None:
         """
@@ -133,9 +138,18 @@ class RealKeithley2636(AbstractSMU):
         self, smu_channel: str, voltage: float, current_limit: float
     ) -> None:
         """Set the specified channel to voltage source mode and compliance."""
-        self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
-        self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
-        self._send_cmd(f"{smu_channel}.source.limiti = {current_limit}")
+        if self._source_modes.get(smu_channel) != "voltage":
+            self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
+            self._source_modes[smu_channel] = "voltage"
+
+        last_limit = self._source_limits.get(smu_channel)
+        if last_limit is None or abs(last_limit - float(current_limit)) > 1e-15:
+            self._send_cmd(f"{smu_channel}.source.limiti = {current_limit}")
+            self._source_limits[smu_channel] = float(current_limit)
+
+        last_level = self._source_levels.get(smu_channel)
+        if last_level is None or abs(last_level - float(voltage)) > 1e-15:
+            self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
         self._source_levels[smu_channel] = float(voltage)
         if current_limit > 0:
             self._current_limits[smu_channel] = float(current_limit)
@@ -172,6 +186,12 @@ class RealKeithley2636(AbstractSMU):
         """Configure measurement aperture, current range, and autozero."""
         if not measurement_items:
             return
+
+        self._measure_state[smu_channel] = {
+            "count": 0,
+            "signature": tuple(measurement_items),
+            "last": {},
+        }
 
         autozero_map = {
             "off": "AUTOZERO_OFF",
@@ -227,13 +247,44 @@ class RealKeithley2636(AbstractSMU):
                 if item in fake_values
             }
 
+        if not measurement_items:
+            return {}
+
+        state = self._measure_state.setdefault(
+            smu_channel,
+            {"count": 0, "signature": tuple(measurement_items), "last": {}},
+        )
+        signature = tuple(measurement_items)
+        if state.get("signature") != signature:
+            state["count"] = 0
+            state["signature"] = signature
+            state["last"] = {}
+
+        state["count"] = int(state.get("count", 0)) + 1
+        last_values = state.get("last", {})
+        if (
+            self.MEASURE_EVERY_N_POINTS > 1
+            and last_values
+            and (int(state["count"]) - 1) % self.MEASURE_EVERY_N_POINTS != 0
+        ):
+            return dict(last_values)  # type: ignore[arg-type]
+
+        selected = [
+            (item, command_map[item])
+            for item in measurement_items
+            if item in command_map
+        ]
+        if not selected:
+            return {}
+
+        expr = ", ".join(f"{smu_channel}.measure.{suffix}()" for _, suffix in selected)
+        reply = self._query_cmd(f"print({expr})")
+        parts = [part for part in re.split(r"[\t,\r\n ]+", reply.strip()) if part]
+
         out: dict[str, float] = {}
-        for item in measurement_items:
-            cmd_suffix = command_map.get(item)
-            if not cmd_suffix:
-                continue
-            reply = self._query_cmd(f"print({smu_channel}.measure.{cmd_suffix}())")
-            out[item] = float(reply)
+        for (item, _), value in zip(selected, parts):
+            out[item] = float(value)
+        state["last"] = dict(out)
         return out
 
     def run_iv_sweep(

@@ -86,56 +86,68 @@ class PreviewGraphWidget(pg.GraphicsLayoutWidget):
         return np.zeros_like(time)
 
 
-class MeasurementGraphWidget(pg.PlotWidget):
+class MeasurementGraphWidget(pg.GraphicsLayoutWidget):
     """
     Plot widget for the Graph tab: real I-V measurement data.
 
-    Manages multiple series (e.g. SMU1 I vs V, SMU2 I vs V) with legend.
-    append_data_point() for real-time points; clear_plot() to reset.
+    Uses two stacked plots so SMU 1 and SMU 2 curves never mix visually.
+    Each subplot manages its own family-of-curves series and legend.
     """
-
-    DEFAULT_SERIES = ("SMU1 I vs V", "SMU2 I vs V")
 
     def __init__(self, parent=None, **kwargs) -> None:
         super().__init__(parent=parent, **kwargs)
         self.setBackground("w")
-        self.showGrid(x=True, y=True, alpha=0.5)
-        self.setLabel("bottom", "Voltage (V)")
-        self.setLabel("left", "Current (A)")
 
-        # Dark pens for visibility on white
-        pens = [
-            pg.mkPen(color=(0.2, 0.2, 0.8), width=2),
-            pg.mkPen(color=(0.8, 0.2, 0.2), width=2),
-        ]
-        self._series: dict[str, PlotDataItem] = {}
-        self._data: dict[str, tuple[list[float], list[float]]] = {}
+        self.plot_smu1 = self.addPlot(row=0, col=0)
+        self.plot_smu1.showGrid(x=True, y=True, alpha=0.5)
+        self.plot_smu1.setLabel("left", "SMU 1 Current (A)")
+        self.plot_smu1.getAxis("bottom").setStyle(showValues=False)
+        self.plot_smu1.addLegend()
 
-        for i, name in enumerate(self.DEFAULT_SERIES):
-            pen = pens[i % len(pens)]
-            curve = self.plot(pen=pen, name=name)
-            self._series[name] = curve
-            self._data[name] = ([], [])
-            curve.setData([], [])
+        self.plot_smu2 = self.addPlot(row=1, col=0)
+        self.plot_smu2.setXLink(self.plot_smu1)
+        self.plot_smu2.showGrid(x=True, y=True, alpha=0.5)
+        self.plot_smu2.setLabel("left", "SMU 2 Current (A)")
+        self.plot_smu2.setLabel("bottom", "Voltage (V)")
+        self.plot_smu2.addLegend()
 
-        self.addLegend()
+        self._plots = {
+            "SMU 1": self.plot_smu1,
+            "SMU 2": self.plot_smu2,
+        }
+        self._series: dict[tuple[str, str], PlotDataItem] = {}
+        self._data: dict[tuple[str, str], tuple[list[float], list[float]]] = {}
+        self._color_index: dict[str, int] = {"SMU 1": 0, "SMU 2": 0}
+        self._palette = {
+            "SMU 1": ["#1565c0", "#00838f", "#3949ab", "#0277bd"],
+            "SMU 2": ["#c62828", "#ef6c00", "#ad1457", "#6d4c41"],
+        }
 
-    def append_data_point(self, x_val: float, y_val: float, series_name: str) -> None:
-        """Append one point to the given series (creates series if missing)."""
-        if series_name not in self._series:
-            curve = self.plot(
-                pen=pg.mkPen(color=(0.2, 0.2, 0.2), width=2),
-                name=series_name,
+    def append_data_point(
+        self, smu_name: str, x_val: float, y_val: float, series_name: str
+    ) -> None:
+        """Append one point to the given SMU subplot series."""
+        key = (smu_name, series_name)
+        if key not in self._series:
+            palette = self._palette.get(smu_name, ["#424242"])
+            color_idx = self._color_index.get(smu_name, 0)
+            pen = pg.mkPen(
+                palette[color_idx % len(palette)],
+                width=2,
             )
-            self._series[series_name] = curve
-            self._data[series_name] = ([], [])
-        xs, ys = self._data[series_name]
+            self._color_index[smu_name] = color_idx + 1
+            curve = self._plots[smu_name].plot(pen=pen, name=series_name)
+            self._series[key] = curve
+            self._data[key] = ([], [])
+            curve.setData([], [])
+        xs, ys = self._data[key]
         xs.append(x_val)
         ys.append(y_val)
-        self._series[series_name].setData(xs, ys)
+        self._series[key].setData(xs, ys)
 
     def clear_plot(self) -> None:
         """Clear all series data."""
-        for name in self._series:
-            self._data[name] = ([], [])
-            self._series[name].setData([], [])
+        for key in self._series:
+            self._data[key] = ([], [])
+            self._series[key].setData([], [])
+        self._color_index = {"SMU 1": 0, "SMU 2": 0}
