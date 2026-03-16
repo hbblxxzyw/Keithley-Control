@@ -2,12 +2,13 @@
 Main controller: connects MainWindowUI and AbstractSMU, binds signals and slots.
 """
 
+import json
 import time
 from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
 from PySide6.QtCore import QThread, Signal
-from PySide6.QtWidgets import QTableWidgetItem
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
 
 from core.instrument_base import AbstractSMU
 
@@ -53,6 +54,7 @@ class SweepWorker(QThread):
         points: int = p["points"]
         stepper_points_assigned: int = p["stepper_points_assigned"]
         src_meas_delay: float = p["src_meas_delay"]
+        step_sweep_delay: float = p["step_sweep_delay"]
         nplc: float = p["nplc"]
         primary_dual: bool = p["primary_dual"]
         stepper_dual: bool = p["stepper_dual"]
@@ -64,6 +66,7 @@ class SweepWorker(QThread):
         rd_delay: float = p["rd_delay"]
 
         delay_s = max(0.0, src_meas_delay)
+        step_sweep_delay_s = max(0.0, step_sweep_delay)
 
         def emit_iv_sweep(
             sweep_start: float,
@@ -120,6 +123,8 @@ class SweepWorker(QThread):
                     stepper_channel, stepper_level, stepper_limit
                 )
                 self.instrument.set_output(stepper_channel, True)
+                if step_sweep_delay_s > 0:
+                    time.sleep(step_sweep_delay_s)
 
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
                 run_primary_sweep(series_name)
@@ -143,8 +148,8 @@ class SweepWorker(QThread):
                         stepper_channel, float(step_val), stepper_limit
                     )
                     self.instrument.set_output(stepper_channel, True)
-                    if delay_s > 0:
-                        time.sleep(delay_s)
+                    if step_sweep_delay_s > 0:
+                        time.sleep(step_sweep_delay_s)
 
                     series_name = f"{primary_name} (Step={step_val:.2f}V)"
                     run_primary_sweep(series_name)
@@ -176,7 +181,11 @@ class MainController:
 
     def bind_signals(self) -> None:
         """Bind UI signals: channel_config_changed and smu_selector change -> update summary and preview."""
+        self.ui.scan_btn.clicked.connect(self.handle_scan)
         self.ui.connect_btn.clicked.connect(self.handle_connect)
+        self.ui.import_config_btn.clicked.connect(self.handle_import_config)
+        self.ui.export_config_btn.clicked.connect(self.handle_export_config)
+        self.ui.reset_config_btn.clicked.connect(self.handle_reset_config)
         self.ui.run_btn.clicked.connect(self.handle_run)
         self.ui.clear_plot_btn.clicked.connect(self.handle_clear_plot)
         self.ui.channel_config_changed.connect(self.update_preview_and_summary)
@@ -204,6 +213,84 @@ class MainController:
                 "color: #b71c1c; font-weight: bold;"
             )
             self.ui.run_btn.setEnabled(False)
+
+    def handle_scan(self) -> None:
+        """Scan VISA resources and populate the most likely Keithley 2636 address."""
+        finder = getattr(self.instrument, "find_resource_address", None)
+        resource_str = None
+        if callable(finder):
+            resource_str = finder(preferred_serial="4399155")
+
+        if resource_str:
+            self.ui.resource_address_edit.setText(resource_str)
+            QMessageBox.information(
+                self.ui,
+                "Scan Complete",
+                f"Found instrument address:\n{resource_str}",
+            )
+            return
+
+        QMessageBox.warning(
+            self.ui,
+            "Scan Complete",
+            "No matching Keithley instrument was found.",
+        )
+
+    def handle_export_config(self) -> None:
+        """Save the current UI configuration to a JSON file."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.ui,
+            "Export Configuration",
+            "keithley_config.json",
+            "JSON Files (*.json)",
+        )
+        if not file_path:
+            return
+
+        payload = {
+            "format": "keithley-gui-config",
+            "version": 1,
+            "settings": self.ui.collect_settings(),
+        }
+        with open(file_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+    def handle_import_config(self) -> None:
+        """Load a previously saved UI configuration from a JSON file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self.ui,
+            "Import Configuration",
+            "",
+            "JSON Files (*.json)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            QMessageBox.critical(
+                self.ui,
+                "Import Failed",
+                f"Could not read configuration file.\n{exc}",
+            )
+            return
+
+        settings = payload.get("settings") if isinstance(payload, dict) else None
+        if not isinstance(settings, dict):
+            QMessageBox.critical(
+                self.ui,
+                "Import Failed",
+                "The selected file is not a valid configuration file.",
+            )
+            return
+
+        self.ui.apply_settings(settings)
+
+    def handle_reset_config(self) -> None:
+        """Restore the UI to its default settings."""
+        self.ui.reset_settings()
 
     def update_preview_and_summary(self, *args: object) -> None:
         """
@@ -277,12 +364,18 @@ class MainController:
             pri_mode = mode2
             step_mode = mode1
         else:
-            # No stepper: SMU1 as primary, SMU2 disabled
-            pts1_base = sweep_points
-            pts2_base = 0
-            pri_dual = dual1
+            # No stepper: prefer the only sweep-capable SMU as primary.
+            if mode2 == "sweep" and mode1 != "sweep":
+                pts1_base = 0
+                pts2_base = sweep_points
+                pri_dual = dual2
+                pri_mode = mode2
+            else:
+                pts1_base = sweep_points
+                pts2_base = 0
+                pri_dual = dual1
+                pri_mode = mode1
             step_dual = False
-            pri_mode = mode1
             step_mode = "fixed"
 
         def compute_step(start: float, stop: float, points: int) -> float:
@@ -545,30 +638,60 @@ class MainController:
             rd_step = float(self.ui.ramp_down_step_smu2.value())
             rd_delay = float(self.ui.ramp_down_delay_smu2.value())
         else:
-            # Fallback: no stepper, SMU1 primary
-            primary_name = "SMU 1"
-            stepper_name = "SMU 2"
-            primary_channel = "smua"
-            stepper_channel = "smub"
-            pri_start = self.ui.start_spin_smu1.value()
-            pri_stop = self.ui.stop_spin_smu1.value()
-            primary_limit = self.ui.limit_spin_smu1.value()
-            pri_mode = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
-            stepper_level = self.ui.level_spin_smu2.value()
-            stepper_limit = self.ui.limit_spin_smu2.value()
-            stepper_start = self.ui.start_spin_smu2.value()
-            stepper_stop = self.ui.stop_spin_smu2.value()
-            stepper_mode = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
+            mode1 = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
+            mode2 = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
+
+            if mode2 == "sweep" and mode1 != "sweep":
+                primary_name = "SMU 2"
+                stepper_name = "SMU 1"
+                primary_channel = "smub"
+                stepper_channel = "smua"
+                pri_start = self.ui.start_spin_smu2.value()
+                pri_stop = self.ui.stop_spin_smu2.value()
+                primary_limit = self.ui.limit_spin_smu2.value()
+                pri_mode = mode2
+                stepper_level = self.ui.level_spin_smu1.value()
+                stepper_limit = self.ui.limit_spin_smu1.value()
+                stepper_start = self.ui.start_spin_smu1.value()
+                stepper_stop = self.ui.stop_spin_smu1.value()
+                stepper_mode = mode1
+                primary_dual = self.ui.dual_sweep_check_smu2.isChecked()
+                ramp_up = self.ui.ramp_up_check_smu2.isChecked()
+                ru_step = float(self.ui.ramp_up_step_smu2.value())
+                ru_delay = float(self.ui.ramp_up_delay_smu2.value())
+                ramp_down = self.ui.ramp_down_check_smu2.isChecked()
+                rd_step = float(self.ui.ramp_down_step_smu2.value())
+                rd_delay = float(self.ui.ramp_down_delay_smu2.value())
+            else:
+                primary_name = "SMU 1"
+                stepper_name = "SMU 2"
+                primary_channel = "smua"
+                stepper_channel = "smub"
+                pri_start = self.ui.start_spin_smu1.value()
+                pri_stop = self.ui.stop_spin_smu1.value()
+                primary_limit = self.ui.limit_spin_smu1.value()
+                pri_mode = mode1
+                stepper_level = self.ui.level_spin_smu2.value()
+                stepper_limit = self.ui.limit_spin_smu2.value()
+                stepper_start = self.ui.start_spin_smu2.value()
+                stepper_stop = self.ui.stop_spin_smu2.value()
+                stepper_mode = mode2
+                primary_dual = self.ui.dual_sweep_check_smu1.isChecked()
+                ramp_up = self.ui.ramp_up_check_smu1.isChecked()
+                ru_step = float(self.ui.ramp_up_step_smu1.value())
+                ru_delay = float(self.ui.ramp_up_delay_smu1.value())
+                ramp_down = self.ui.ramp_down_check_smu1.isChecked()
+                rd_step = float(self.ui.ramp_down_step_smu1.value())
+                rd_delay = float(self.ui.ramp_down_delay_smu1.value())
+
             primary_points = sweep_points
             stepper_points_assigned = 0
-            primary_dual = self.ui.dual_sweep_check_smu1.isChecked()
             stepper_dual = False
-            ramp_up = self.ui.ramp_up_check_smu1.isChecked()
-            ru_step = float(self.ui.ramp_up_step_smu1.value())
-            ru_delay = float(self.ui.ramp_up_delay_smu1.value())
-            ramp_down = self.ui.ramp_down_check_smu1.isChecked()
-            rd_step = float(self.ui.ramp_down_step_smu1.value())
-            rd_delay = float(self.ui.ramp_down_delay_smu1.value())
+
+        if pri_mode != "sweep":
+            self.ui.run_btn.setEnabled(True)
+            self.ui.abort_btn.setEnabled(False)
+            return
 
         points = max(2, int(primary_points)) if pri_mode == "sweep" else 2
 
@@ -578,6 +701,7 @@ class MainController:
 
         # Additional timing / measurement parameters
         src_meas_delay = float(self.ui.src_meas_delay_spin.value())
+        step_sweep_delay = float(self.ui.step_sweep_delay_spin.value())
         nplc = float(self.ui.nplc_spin.value())
 
         params: Dict[str, Any] = {
@@ -598,6 +722,7 @@ class MainController:
             "points": points,
             "stepper_points_assigned": stepper_points_assigned,
             "src_meas_delay": src_meas_delay,
+            "step_sweep_delay": step_sweep_delay,
             "nplc": nplc,
             "primary_dual": primary_dual,
             "stepper_dual": stepper_dual,

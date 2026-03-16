@@ -101,6 +101,28 @@ class RealKeithley2636(AbstractSMU):
             self._resource.close()
             self._resource = None
 
+    def find_resource_address(self, preferred_serial: str | None = None) -> str | None:
+        """Return the most likely VISA resource address for the target instrument."""
+        try:
+            resources = list(self._rm.list_resources())
+        except Exception:
+            return None
+
+        if preferred_serial:
+            for resource in resources:
+                if preferred_serial in resource:
+                    return resource
+
+        for resource in resources:
+            if "USB" in resource.upper() and "::1510::" in resource:
+                return resource
+
+        for resource in resources:
+            if resource.upper().startswith(("USB", "TCPIP", "ASRL")):
+                return resource
+
+        return None
+
     def set_output(self, smu_channel: str, state: bool) -> None:
         """Turn the specified channel (smua/smub) output on or off."""
         on_off = "OUTPUT_ON" if state else "OUTPUT_OFF"

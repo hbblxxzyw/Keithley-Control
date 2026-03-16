@@ -43,6 +43,219 @@ class MainWindowUI(QMainWindow):
         """统一的槽函数，用于转发所有表单变动"""
         self.channel_config_changed.emit()
 
+    def _mode_text(self, smu_index: int) -> str:
+        combo = getattr(self, f"mode_combo_smu{smu_index}", None)
+        return str(combo.currentText() or "").strip().lower() if combo else "fixed"
+
+    def _apply_channel_mode_state(self, smu_index: int) -> None:
+        is_sweep = self._mode_text(smu_index) == "sweep"
+        getattr(self, f"level_spin_smu{smu_index}").setEnabled(not is_sweep)
+        getattr(self, f"start_spin_smu{smu_index}").setEnabled(is_sweep)
+        getattr(self, f"stop_spin_smu{smu_index}").setEnabled(is_sweep)
+        getattr(self, f"step_display_smu{smu_index}").setEnabled(is_sweep)
+        dual_check = getattr(self, f"dual_sweep_check_smu{smu_index}")
+        dual_check.setEnabled(is_sweep)
+        dual_check.setVisible(is_sweep)
+
+    def _apply_common_settings_state(self) -> None:
+        mode1 = self._mode_text(1)
+        mode2 = self._mode_text(2)
+        sweep_modes = [idx for idx, mode in ((1, mode1), (2, mode2)) if mode == "sweep"]
+
+        self.sweep_points_spin.setEnabled(bool(sweep_modes))
+
+        current_stepper = str(self.stepper_selector.currentText() or "").strip()
+        allowed_stepper_options = ["None"]
+        if len(sweep_modes) == 2:
+            allowed_stepper_options.extend(["SMU 2", "SMU 1"])
+
+        self.stepper_selector.blockSignals(True)
+        self.stepper_selector.clear()
+        self.stepper_selector.addItems(allowed_stepper_options)
+        if current_stepper in allowed_stepper_options:
+            self.stepper_selector.setCurrentText(current_stepper)
+        else:
+            self.stepper_selector.setCurrentText("None")
+        self.stepper_selector.setEnabled(len(allowed_stepper_options) > 1)
+        self.stepper_selector.blockSignals(False)
+
+        has_stepper_sweep = self.stepper_selector.currentText() != "None"
+        self.stepper_points_spin.setEnabled(has_stepper_sweep)
+        self.step_sweep_delay_spin.setEnabled(has_stepper_sweep)
+
+    def _refresh_dynamic_ui_state(self) -> None:
+        self._apply_channel_mode_state(1)
+        self._apply_channel_mode_state(2)
+        self._apply_common_settings_state()
+
+    def _config_widgets(self) -> list[QWidget]:
+        widgets: list[QWidget] = [
+            self.resource_address_edit,
+            self.nplc_spin,
+            self.src_meas_delay_spin,
+            self.step_sweep_delay_spin,
+            self.stepper_selector,
+            self.sweep_points_spin,
+            self.stepper_points_spin,
+            self.repeat_spin,
+            self.time_resolution_spin,
+            self.smu_selector,
+        ]
+        for i in (1, 2):
+            widgets.extend(
+                [
+                    getattr(self, f"function_combo_smu{i}"),
+                    getattr(self, f"mode_combo_smu{i}"),
+                    getattr(self, f"dual_sweep_check_smu{i}"),
+                    getattr(self, f"ramp_up_check_smu{i}"),
+                    getattr(self, f"ramp_up_step_smu{i}"),
+                    getattr(self, f"ramp_up_delay_smu{i}"),
+                    getattr(self, f"ramp_down_check_smu{i}"),
+                    getattr(self, f"ramp_down_step_smu{i}"),
+                    getattr(self, f"ramp_down_delay_smu{i}"),
+                    getattr(self, f"level_spin_smu{i}"),
+                    getattr(self, f"start_spin_smu{i}"),
+                    getattr(self, f"stop_spin_smu{i}"),
+                    getattr(self, f"limit_spin_smu{i}"),
+                ]
+            )
+        return widgets
+
+    def collect_settings(self) -> dict:
+        return {
+            "resource_address": self.resource_address_edit.text(),
+            "active_smu_page": int(self.smu_selector.currentIndex()),
+            "time_resolution": float(self.time_resolution_spin.value()),
+            "common": {
+                "nplc": float(self.nplc_spin.value()),
+                "src_meas_delay": float(self.src_meas_delay_spin.value()),
+                "step_sweep_delay": float(self.step_sweep_delay_spin.value()),
+                "stepper": str(self.stepper_selector.currentText() or "").strip(),
+                "sweep_points": int(self.sweep_points_spin.value()),
+                "stepper_points": int(self.stepper_points_spin.value()),
+                "repeat": int(self.repeat_spin.value()),
+            },
+            "smu1": self._collect_smu_settings(1),
+            "smu2": self._collect_smu_settings(2),
+        }
+
+    def _collect_smu_settings(self, smu_index: int) -> dict:
+        return {
+            "function": str(getattr(self, f"function_combo_smu{smu_index}").currentText()),
+            "mode": str(getattr(self, f"mode_combo_smu{smu_index}").currentText()),
+            "dual": bool(getattr(self, f"dual_sweep_check_smu{smu_index}").isChecked()),
+            "ramp_up": {
+                "enabled": bool(getattr(self, f"ramp_up_check_smu{smu_index}").isChecked()),
+                "step": float(getattr(self, f"ramp_up_step_smu{smu_index}").value()),
+                "delay": float(getattr(self, f"ramp_up_delay_smu{smu_index}").value()),
+            },
+            "ramp_down": {
+                "enabled": bool(getattr(self, f"ramp_down_check_smu{smu_index}").isChecked()),
+                "step": float(getattr(self, f"ramp_down_step_smu{smu_index}").value()),
+                "delay": float(getattr(self, f"ramp_down_delay_smu{smu_index}").value()),
+            },
+            "level": float(getattr(self, f"level_spin_smu{smu_index}").value()),
+            "start": float(getattr(self, f"start_spin_smu{smu_index}").value()),
+            "stop": float(getattr(self, f"stop_spin_smu{smu_index}").value()),
+            "limit": float(getattr(self, f"limit_spin_smu{smu_index}").value()),
+        }
+
+    def apply_settings(self, settings: dict) -> None:
+        widgets = self._config_widgets()
+        for widget in widgets:
+            widget.blockSignals(True)
+
+        try:
+            self.resource_address_edit.setText(str(settings.get("resource_address", "")))
+            self.time_resolution_spin.setValue(
+                float(settings.get("time_resolution", self.time_resolution_spin.value()))
+            )
+
+            for smu_index in (1, 2):
+                smu_cfg = settings.get(f"smu{smu_index}", {})
+                getattr(self, f"function_combo_smu{smu_index}").setCurrentText(
+                    str(smu_cfg.get("function", getattr(self, f"function_combo_smu{smu_index}").currentText()))
+                )
+                getattr(self, f"mode_combo_smu{smu_index}").setCurrentText(
+                    str(smu_cfg.get("mode", getattr(self, f"mode_combo_smu{smu_index}").currentText()))
+                )
+                getattr(self, f"dual_sweep_check_smu{smu_index}").setChecked(
+                    bool(smu_cfg.get("dual", False))
+                )
+
+                ramp_up_cfg = smu_cfg.get("ramp_up", {})
+                getattr(self, f"ramp_up_check_smu{smu_index}").setChecked(
+                    bool(ramp_up_cfg.get("enabled", False))
+                )
+                getattr(self, f"ramp_up_step_smu{smu_index}").setValue(
+                    float(ramp_up_cfg.get("step", getattr(self, f"ramp_up_step_smu{smu_index}").value()))
+                )
+                getattr(self, f"ramp_up_delay_smu{smu_index}").setValue(
+                    float(ramp_up_cfg.get("delay", getattr(self, f"ramp_up_delay_smu{smu_index}").value()))
+                )
+
+                ramp_down_cfg = smu_cfg.get("ramp_down", {})
+                getattr(self, f"ramp_down_check_smu{smu_index}").setChecked(
+                    bool(ramp_down_cfg.get("enabled", False))
+                )
+                getattr(self, f"ramp_down_step_smu{smu_index}").setValue(
+                    float(ramp_down_cfg.get("step", getattr(self, f"ramp_down_step_smu{smu_index}").value()))
+                )
+                getattr(self, f"ramp_down_delay_smu{smu_index}").setValue(
+                    float(ramp_down_cfg.get("delay", getattr(self, f"ramp_down_delay_smu{smu_index}").value()))
+                )
+
+                getattr(self, f"level_spin_smu{smu_index}").setValue(
+                    float(smu_cfg.get("level", getattr(self, f"level_spin_smu{smu_index}").value()))
+                )
+                getattr(self, f"start_spin_smu{smu_index}").setValue(
+                    float(smu_cfg.get("start", getattr(self, f"start_spin_smu{smu_index}").value()))
+                )
+                getattr(self, f"stop_spin_smu{smu_index}").setValue(
+                    float(smu_cfg.get("stop", getattr(self, f"stop_spin_smu{smu_index}").value()))
+                )
+                getattr(self, f"limit_spin_smu{smu_index}").setValue(
+                    float(smu_cfg.get("limit", getattr(self, f"limit_spin_smu{smu_index}").value()))
+                )
+
+            self._refresh_dynamic_ui_state()
+
+            common_cfg = settings.get("common", {})
+            self.nplc_spin.setValue(float(common_cfg.get("nplc", self.nplc_spin.value())))
+            self.src_meas_delay_spin.setValue(
+                float(common_cfg.get("src_meas_delay", self.src_meas_delay_spin.value()))
+            )
+            self.step_sweep_delay_spin.setValue(
+                float(common_cfg.get("step_sweep_delay", self.step_sweep_delay_spin.value()))
+            )
+            self.sweep_points_spin.setValue(
+                int(common_cfg.get("sweep_points", self.sweep_points_spin.value()))
+            )
+            self.stepper_points_spin.setValue(
+                int(common_cfg.get("stepper_points", self.stepper_points_spin.value()))
+            )
+            self.repeat_spin.setValue(int(common_cfg.get("repeat", self.repeat_spin.value())))
+
+            stepper_text = str(common_cfg.get("stepper", self.stepper_selector.currentText()))
+            if stepper_text in [
+                self.stepper_selector.itemText(i)
+                for i in range(self.stepper_selector.count())
+            ]:
+                self.stepper_selector.setCurrentText(stepper_text)
+
+            self.smu_selector.setCurrentIndex(
+                int(settings.get("active_smu_page", self.smu_selector.currentIndex()))
+            )
+            self._refresh_dynamic_ui_state()
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+        self.emit_config_changed()
+
+    def reset_settings(self) -> None:
+        self.apply_settings(self._default_settings)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Keithley 2636 SMU Control")
@@ -71,6 +284,7 @@ class MainWindowUI(QMainWindow):
         self.table_tab = QWidget()
         self._build_table_tab()
         self.tab_widget.addTab(self.table_tab, "Table")
+        self._default_settings = self.collect_settings()
 
     def _build_settings_tab(self) -> None:
         layout = QVBoxLayout(self.settings_tab)
@@ -82,8 +296,16 @@ class MainWindowUI(QMainWindow):
         self.resource_address_edit.setPlaceholderText("e.g. TCPIP0::192.168.1.100::inst0::INSTR")
         self.resource_address_edit.setText("TCPIP0::192.168.1.100::inst0::INSTR")
         conn_layout.addWidget(self.resource_address_edit)
+        self.scan_btn = QPushButton("Scan")
+        conn_layout.addWidget(self.scan_btn)
         self.connect_btn = QPushButton("Connect")
         conn_layout.addWidget(self.connect_btn)
+        self.import_config_btn = QPushButton("Import Config")
+        conn_layout.addWidget(self.import_config_btn)
+        self.export_config_btn = QPushButton("Export Config")
+        conn_layout.addWidget(self.export_config_btn)
+        self.reset_config_btn = QPushButton("Reset")
+        conn_layout.addWidget(self.reset_config_btn)
         self.connection_status_label = QLabel("Disconnected")
         self.connection_status_label.setStyleSheet("color: gray; font-weight: bold;")
         conn_layout.addWidget(self.connection_status_label)
@@ -166,7 +388,6 @@ class MainWindowUI(QMainWindow):
         self.channel_stacked.addWidget(self._build_smu_form_page(1))
         self.channel_stacked.addWidget(self._build_smu_form_page(2))
         self.smu_selector.currentIndexChanged.connect(self.channel_stacked.setCurrentIndex)
-        self._connect_smu_form_signals()
         channel_layout.addWidget(self.channel_stacked)
         lower_layout.addWidget(channel_group, 1)
 
@@ -203,7 +424,7 @@ class MainWindowUI(QMainWindow):
         self.step_sweep_delay_spin.valueChanged.connect(self.emit_config_changed)
 
         self.stepper_selector = QComboBox()
-        self.stepper_selector.addItems(["SMU 2", "SMU 1"])
+        self.stepper_selector.addItems(["None", "SMU 2", "SMU 1"])
         common_layout.addRow("Stepper:", self.stepper_selector)
         self.stepper_selector.currentIndexChanged.connect(self.emit_config_changed)
 
@@ -261,6 +482,7 @@ class MainWindowUI(QMainWindow):
         lower_layout.addWidget(common_group, 1)
 
         layout.addLayout(lower_layout)
+        self._connect_smu_form_signals()
 
     def _build_smu_form_page(self, smu_index: int) -> QWidget:
         """Build one Channel Settings form page for the given SMU (1 or 2)."""
@@ -322,13 +544,17 @@ class MainWindowUI(QMainWindow):
         ramp_container_layout.addWidget(ramp_down_row)
 
         def update_ramp_visibility() -> None:
-            is_voltage = function_combo.currentText() == "Voltage"
-            ramp_container.setVisible(is_voltage)
-            if is_voltage:
+            is_voltage_sweep = (
+                function_combo.currentText() == "Voltage"
+                and mode_combo.currentText() == "Sweep"
+            )
+            ramp_container.setVisible(is_voltage_sweep)
+            if is_voltage_sweep:
                 ramp_up_row.setVisible(ramp_up_check.isChecked())
                 ramp_down_row.setVisible(ramp_down_check.isChecked())
 
         function_combo.currentTextChanged.connect(update_ramp_visibility)
+        mode_combo.currentTextChanged.connect(update_ramp_visibility)
         ramp_up_check.stateChanged.connect(update_ramp_visibility)
         ramp_down_check.stateChanged.connect(update_ramp_visibility)
         update_ramp_visibility()
@@ -357,6 +583,7 @@ class MainWindowUI(QMainWindow):
         limit_spin = QDoubleSpinBox()
         limit_spin.setRange(1e-9, 10.0)
         limit_spin.setDecimals(4)
+        limit_spin.setSingleStep(0.01)
         limit_spin.setSuffix(" A")
         form.addRow("Limit:", limit_spin)
 
@@ -397,6 +624,13 @@ class MainWindowUI(QMainWindow):
             getattr(self, f"start_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"stop_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"limit_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
+            getattr(self, f"function_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
+            getattr(self, f"mode_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
+            getattr(self, f"ramp_up_check_smu{i}").stateChanged.connect(self._refresh_dynamic_ui_state)
+            getattr(self, f"ramp_down_check_smu{i}").stateChanged.connect(self._refresh_dynamic_ui_state)
+
+        self.stepper_selector.currentTextChanged.connect(self._refresh_dynamic_ui_state)
+        self._refresh_dynamic_ui_state()
 
     def _build_graph_tab(self) -> None:
         layout = QVBoxLayout(self.graph_tab)
