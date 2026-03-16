@@ -27,6 +27,7 @@ class SweepWorker(QThread):
 
     data_ready = Signal(dict)
     finished_sweep = Signal()
+    SECONDARY_MEASURE_EVERY_CHUNK = True
 
     def __init__(
         self,
@@ -71,104 +72,140 @@ class SweepWorker(QThread):
         delay_s = max(0.0, src_meas_delay)
         step_sweep_delay_s = max(0.0, step_sweep_delay)
 
-        def build_linear_points(start: float, stop: float, count: int) -> list[float]:
-            if count <= 0:
-                return []
-            if count == 1:
-                return [float(start)]
-            return np.linspace(float(start), float(stop), int(count)).tolist()
+        def build_primary_values(
+            source_values: list[float],
+            current_values: list[float],
+        ) -> list[dict[str, float]]:
+            values_per_point: list[dict[str, float]] = []
+            requested_items = list(measure_cfg[primary_channel]["items"])
+            for voltage, current in zip(source_values, current_values):
+                point_values: dict[str, float] = {}
+                if "Voltage" in requested_items:
+                    point_values["Voltage"] = float(voltage)
+                if "Current" in requested_items:
+                    point_values["Current"] = float(current)
+                if "Resistance" in requested_items:
+                    if abs(current) > 1e-15:
+                        point_values["Resistance"] = float(voltage) / float(current)
+                    else:
+                        point_values["Resistance"] = float("inf")
+                values_per_point.append(point_values)
+            return values_per_point
 
-        def build_ramp_points(start: float, stop: float, step_size: float) -> list[float]:
-            distance = abs(float(stop) - float(start))
-            safe_step = max(float(step_size), 1e-9)
-            count = max(2, int(np.ceil(distance / safe_step)) + 1)
-            return build_linear_points(start, stop, count)
+        def secondary_channel_name() -> str:
+            return "smub" if primary_channel == "smua" else "smua"
 
-        def extend_without_duplicate(base: list[float], extra: list[float]) -> None:
-            if not extra:
-                return
-            if base and abs(base[-1] - extra[0]) < 1e-12:
-                base.extend(extra[1:])
-            else:
-                base.extend(extra)
+        def measure_secondary_chunk() -> dict[str, float]:
+            secondary_channel = secondary_channel_name()
+            return self.instrument.measure_selected(
+                secondary_channel,
+                list(measure_cfg[secondary_channel]["items"]),
+            )
 
-        def build_primary_sequence() -> list[float]:
-            main_points = build_linear_points(pri_start, pri_stop, points)
-            sequence: list[float] = []
-            if ramp_up and abs(pri_start) > 0:
-                extend_without_duplicate(
-                    sequence,
-                    build_ramp_points(0.0, pri_start, ru_step),
-                )
-            extend_without_duplicate(sequence, main_points)
-            if primary_dual and len(main_points) > 1:
-                extend_without_duplicate(sequence, main_points[-2::-1])
-            end_value = sequence[-1] if sequence else pri_stop
-            if ramp_down and abs(end_value) > 0:
-                extend_without_duplicate(
-                    sequence,
-                    build_ramp_points(end_value, 0.0, rd_step),
-                )
-            return sequence
-
-        def emit_measurement(
+        def build_payload(
             started_at: float,
             series_name: str,
             primary_setpoint: float,
             stepper_setpoint: float,
+            primary_values: dict[str, float],
+            secondary_values: dict[str, float],
+        ) -> dict[str, object]:
+            smu1_values = primary_values if primary_channel == "smua" else secondary_values
+            smu2_values = primary_values if primary_channel == "smub" else secondary_values
+            return {
+                "time_s": time.monotonic() - started_at,
+                "series_name": series_name,
+                "primary_name": primary_name,
+                "stepper_name": stepper_name,
+                "smu1": {
+                    "source_v": primary_setpoint if primary_channel == "smua" else stepper_setpoint,
+                    "values": smu1_values,
+                },
+                "smu2": {
+                    "source_v": primary_setpoint if primary_channel == "smub" else stepper_setpoint,
+                    "values": smu2_values,
+                },
+            }
+
+        def emit_chunk_payloads(
+            started_at: float,
+            series_name: str,
+            stepper_setpoint: float,
+            source_values: list[float],
+            current_values: list[float],
         ) -> None:
-            smu1_values = self.instrument.measure_selected(
-                "smua", list(measure_cfg["smua"]["items"])
-            )
-            smu2_values = self.instrument.measure_selected(
-                "smub", list(measure_cfg["smub"]["items"])
-            )
-            self.data_ready.emit(
-                {
-                    "time_s": time.monotonic() - started_at,
-                    "series_name": series_name,
-                    "primary_name": primary_name,
-                    "stepper_name": stepper_name,
-                    "smu1": {
-                        "source_v": primary_setpoint
-                        if primary_channel == "smua"
-                        else stepper_setpoint,
-                        "values": smu1_values,
-                    },
-                    "smu2": {
-                        "source_v": primary_setpoint
-                        if primary_channel == "smub"
-                        else stepper_setpoint,
-                        "values": smu2_values,
-                    },
-                }
-            )
+            primary_points = build_primary_values(source_values, current_values)
+            secondary_chunk_values = measure_secondary_chunk()
+            for source_value, primary_values in zip(source_values, primary_points):
+                payload = build_payload(
+                    started_at,
+                    series_name,
+                    float(source_value),
+                    float(stepper_setpoint),
+                    primary_values,
+                    dict(secondary_chunk_values),
+                )
+                self.data_ready.emit(payload)
+
+        def stream_iv_pass(
+            started_at: float,
+            series_name: str,
+            stepper_setpoint: float,
+            sweep_start: float,
+            sweep_stop: float,
+            sweep_points: int,
+            use_ramp_up: bool,
+            use_ramp_down: bool,
+        ) -> None:
+            for source_chunk, current_chunk in self.instrument.run_iv_sweep(
+                primary_channel,
+                sweep_start,
+                sweep_stop,
+                sweep_points,
+                delay_s,
+                nplc,
+                primary_limit,
+                use_ramp_up,
+                ru_step,
+                ru_delay,
+                use_ramp_down,
+                rd_step,
+                rd_delay,
+            ):
+                emit_chunk_payloads(
+                    started_at,
+                    series_name,
+                    stepper_setpoint,
+                    list(source_chunk),
+                    list(current_chunk),
+                )
 
         def run_primary_sweep(series_name: str, stepper_setpoint: float) -> None:
             started_at = time.monotonic()
-            self.instrument.set_voltage_source(primary_channel, pri_start, primary_limit)
-            self.instrument.set_output(primary_channel, True)
-            primary_sequence = build_primary_sequence()
-            for index, primary_value in enumerate(primary_sequence):
-                self.instrument.set_voltage_source(
-                    primary_channel,
-                    float(primary_value),
-                    primary_limit,
-                )
-                if delay_s > 0:
-                    time.sleep(delay_s)
-                emit_measurement(
+            stream_iv_pass(
+                started_at,
+                series_name,
+                stepper_setpoint,
+                pri_start,
+                pri_stop,
+                points,
+                ramp_up,
+                False if primary_dual else ramp_down,
+            )
+
+            if primary_dual and points > 1:
+                step_v = (pri_stop - pri_start) / float(points - 1)
+                reverse_start = pri_stop - step_v
+                stream_iv_pass(
                     started_at,
                     series_name,
-                    float(primary_value),
-                    float(stepper_setpoint),
+                    stepper_setpoint,
+                    reverse_start,
+                    pri_start,
+                    points - 1,
+                    False,
+                    ramp_down,
                 )
-                if index < len(primary_sequence) - 1:
-                    next_value = primary_sequence[index + 1]
-                    if ramp_up and abs(next_value) > abs(primary_value) and ru_delay > 0:
-                        time.sleep(ru_delay)
-                    elif ramp_down and abs(next_value) < abs(primary_value) and rd_delay > 0:
-                        time.sleep(rd_delay)
 
         try:
             for channel in ("smua", "smub"):
@@ -679,11 +716,8 @@ class MainController:
                     + (" (dual)" if dual else "")
                 )
 
-        duration = self.ui.time_resolution_spin.value()
-        if duration <= 0:
-            duration = 1.0
         self.ui.preview_plot_placeholder.update_preview(
-            smu1_cfg, smu2_cfg, duration=duration
+            smu1_cfg, smu2_cfg, duration=1.0
         )
 
     def handle_run(self) -> None:
@@ -869,20 +903,26 @@ class MainController:
         Slot for SweepWorker.data_ready: update graph and table in the UI thread.
         """
         series_name = str(payload.get("series_name", ""))
+        primary_name = str(payload.get("primary_name", ""))
         smu1_values = payload.get("smu1", {}).get("values", {})
         smu2_values = payload.get("smu2", {}).get("values", {})
 
-        if "Voltage" in smu1_values and "Current" in smu1_values:
+        if primary_name == "SMU 1":
+            sweep_x = smu1_values.get("Voltage")
+        else:
+            sweep_x = smu2_values.get("Voltage")
+
+        if sweep_x is not None and "Current" in smu1_values:
             self.ui.graph_plot_placeholder.append_data_point(
                 "SMU 1",
-                float(smu1_values["Voltage"]),
+                float(sweep_x),
                 float(smu1_values["Current"]),
                 series_name,
             )
-        if "Voltage" in smu2_values and "Current" in smu2_values:
+        if sweep_x is not None and "Current" in smu2_values:
             self.ui.graph_plot_placeholder.append_data_point(
                 "SMU 2",
-                float(smu2_values["Voltage"]),
+                float(sweep_x),
                 float(smu2_values["Current"]),
                 series_name,
             )

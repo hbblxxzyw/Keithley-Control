@@ -86,35 +86,22 @@ class PreviewGraphWidget(pg.GraphicsLayoutWidget):
         return np.zeros_like(time)
 
 
-class MeasurementGraphWidget(pg.GraphicsLayoutWidget):
+class MeasurementGraphWidget(pg.PlotWidget):
     """
     Plot widget for the Graph tab: real I-V measurement data.
 
-    Uses two stacked plots so SMU 1 and SMU 2 curves never mix visually.
-    Each subplot manages its own family-of-curves series and legend.
+    Uses a single plot with separate series for SMU 1 and SMU 2.
+    All curves share the same sweep-voltage X axis.
     """
 
     def __init__(self, parent=None, **kwargs) -> None:
         super().__init__(parent=parent, **kwargs)
         self.setBackground("w")
+        self.showGrid(x=True, y=True, alpha=0.5)
+        self.setLabel("left", "Current (A)")
+        self.setLabel("bottom", "Sweep Voltage (V)")
+        self.addLegend()
 
-        self.plot_smu1 = self.addPlot(row=0, col=0)
-        self.plot_smu1.showGrid(x=True, y=True, alpha=0.5)
-        self.plot_smu1.setLabel("left", "SMU 1 Current (A)")
-        self.plot_smu1.getAxis("bottom").setStyle(showValues=False)
-        self.plot_smu1.addLegend()
-
-        self.plot_smu2 = self.addPlot(row=1, col=0)
-        self.plot_smu2.setXLink(self.plot_smu1)
-        self.plot_smu2.showGrid(x=True, y=True, alpha=0.5)
-        self.plot_smu2.setLabel("left", "SMU 2 Current (A)")
-        self.plot_smu2.setLabel("bottom", "Voltage (V)")
-        self.plot_smu2.addLegend()
-
-        self._plots = {
-            "SMU 1": self.plot_smu1,
-            "SMU 2": self.plot_smu2,
-        }
         self._series: dict[tuple[str, str], PlotDataItem] = {}
         self._data: dict[tuple[str, str], tuple[list[float], list[float]]] = {}
         self._color_index: dict[str, int] = {"SMU 1": 0, "SMU 2": 0}
@@ -126,7 +113,7 @@ class MeasurementGraphWidget(pg.GraphicsLayoutWidget):
     def append_data_point(
         self, smu_name: str, x_val: float, y_val: float, series_name: str
     ) -> None:
-        """Append one point to the given SMU subplot series."""
+        """Append one point to the given SMU series on the shared plot."""
         key = (smu_name, series_name)
         if key not in self._series:
             palette = self._palette.get(smu_name, ["#424242"])
@@ -136,7 +123,7 @@ class MeasurementGraphWidget(pg.GraphicsLayoutWidget):
                 width=2,
             )
             self._color_index[smu_name] = color_idx + 1
-            curve = self._plots[smu_name].plot(pen=pen, name=series_name)
+            curve = self.plot(pen=pen, name=f"{smu_name} | {series_name}")
             self._series[key] = curve
             self._data[key] = ([], [])
             curve.setData([], [])

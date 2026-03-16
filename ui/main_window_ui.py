@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QWidget,
     QTabWidget,
     QStackedWidget,
-    QScrollArea,
     QVBoxLayout,
     QHBoxLayout,
     QFormLayout,
@@ -26,6 +25,9 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QHeaderView,
     QSpinBox,
+    QToolButton,
+    QMenu,
+    QWidgetAction,
 )
 
 from ui.graph_widget import PreviewGraphWidget, MeasurementGraphWidget
@@ -79,6 +81,84 @@ class MultiSelectComboBox(QComboBox):
     def _refresh_text(self) -> None:
         selected = self.selected_items()
         self.lineEdit().setText(", ".join(selected) if selected else "None")
+
+
+class MeasurePopupButton(QWidget):
+    """Compact button that exposes measure settings in a popup menu."""
+
+    selection_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.button = QToolButton()
+        self.button.setPopupMode(QToolButton.InstantPopup)
+        self.button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        layout.addWidget(self.button)
+
+        self.menu = QMenu(self.button)
+        self.menu.setMinimumWidth(260)
+        self.button.setMenu(self.menu)
+
+        panel = QWidget(self.menu)
+        panel_layout = QFormLayout(panel)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.measure_combo = MultiSelectComboBox()
+        self.measure_combo.add_check_items(["Voltage", "Current", "Resistance"])
+        self.measure_combo.set_selected_items(["Voltage", "Current"])
+        panel_layout.addRow("Items:", self.measure_combo)
+
+        self.measure_range_combo = QComboBox()
+        self.measure_range_combo.addItems(
+            [
+                "Auto",
+                "100 pA",
+                "1 nA",
+                "10 nA",
+                "100 nA",
+                "1 uA",
+                "10 uA",
+                "100 uA",
+                "1 mA",
+                "10 mA",
+                "100 mA",
+                "1 A",
+            ]
+        )
+        panel_layout.addRow("Range:", self.measure_range_combo)
+
+        self.measure_autozero_combo = QComboBox()
+        self.measure_autozero_combo.addItems(["On", "Off", "Once"])
+        panel_layout.addRow("Auto Zero:", self.measure_autozero_combo)
+
+        action = QWidgetAction(self.menu)
+        action.setDefaultWidget(panel)
+        self.menu.addAction(action)
+
+        self.measure_combo.selection_changed.connect(self._handle_change)
+        self.measure_range_combo.currentTextChanged.connect(self._handle_change)
+        self.measure_autozero_combo.currentTextChanged.connect(self._handle_change)
+        self._refresh_text()
+
+    def _handle_change(self, *args: object) -> None:
+        self._refresh_text()
+        self.selection_changed.emit()
+
+    def _refresh_text(self) -> None:
+        items = self.measure_combo.selected_items()
+        if items:
+            short_items = ", ".join(
+                {"Voltage": "V", "Current": "A", "Resistance": "Ohm"}.get(item, item)
+                for item in items
+            )
+        else:
+            short_items = "None"
+        self.button.setText(
+            f"{short_items} | {self.measure_range_combo.currentText()} | {self.measure_autozero_combo.currentText()}"
+        )
 
 
 class MainWindowUI(QMainWindow):
@@ -149,7 +229,6 @@ class MainWindowUI(QMainWindow):
             self.sweep_points_spin,
             self.stepper_points_spin,
             self.repeat_spin,
-            self.time_resolution_spin,
             self.smu_selector,
         ]
         for i in (1, 2):
@@ -179,7 +258,6 @@ class MainWindowUI(QMainWindow):
         return {
             "resource_address": self.resource_address_edit.text(),
             "active_smu_page": int(self.smu_selector.currentIndex()),
-            "time_resolution": float(self.time_resolution_spin.value()),
             "common": {
                 "nplc": float(self.nplc_spin.value()),
                 "src_meas_delay": float(self.src_meas_delay_spin.value()),
@@ -232,9 +310,6 @@ class MainWindowUI(QMainWindow):
 
         try:
             self.resource_address_edit.setText(str(settings.get("resource_address", "")))
-            self.time_resolution_spin.setValue(
-                float(settings.get("time_resolution", self.time_resolution_spin.value()))
-            )
 
             for smu_index in (1, 2):
                 smu_cfg = settings.get(f"smu{smu_index}", {})
@@ -302,6 +377,7 @@ class MainWindowUI(QMainWindow):
                         )
                     )
                 )
+                getattr(self, f"measure_popup_smu{smu_index}")._refresh_text()
 
             self._refresh_dynamic_ui_state()
 
@@ -401,22 +477,10 @@ class MainWindowUI(QMainWindow):
         preview_group = QGroupBox("Output Preview")
         preview_layout = QVBoxLayout(preview_group)
 
-        # Toolbar: Time Resolution
-        preview_toolbar = QHBoxLayout()
-        preview_toolbar.addWidget(QLabel("Time Resolution:"))
-        self.time_resolution_spin = QDoubleSpinBox()
-        self.time_resolution_spin.setRange(0.001, 1000.0)
-        self.time_resolution_spin.setValue(0.01)
-        self.time_resolution_spin.setSuffix(" s")
-        self.time_resolution_spin.setDecimals(4)
-        preview_toolbar.addWidget(self.time_resolution_spin)
-        self.time_resolution_spin.valueChanged.connect(self.emit_config_changed)
-        preview_toolbar.addStretch()
-        preview_layout.addLayout(preview_toolbar)
-
         # Preview waveform (Settings tab)
         self.preview_plot_placeholder = PreviewGraphWidget()
-        self.preview_plot_placeholder.setMinimumHeight(200)
+        self.preview_plot_placeholder.setMinimumHeight(120)
+        self.preview_plot_placeholder.setMaximumHeight(160)
         preview_layout.addWidget(self.preview_plot_placeholder)
 
         layout.addWidget(preview_group)
@@ -476,14 +540,8 @@ class MainWindowUI(QMainWindow):
         self.channel_stacked = QStackedWidget()
         self.channel_stacked.addWidget(self._build_smu_form_page(1))
         self.channel_stacked.addWidget(self._build_smu_form_page(2))
-
-        self.channel_scroll = QScrollArea()
-        self.channel_scroll.setWidgetResizable(True)
-        self.channel_scroll.setFrameShape(QScrollArea.NoFrame)
-        self.channel_scroll.setWidget(self.channel_stacked)
-
         self.smu_selector.currentIndexChanged.connect(self.channel_stacked.setCurrentIndex)
-        channel_layout.addWidget(self.channel_scroll)
+        channel_layout.addWidget(self.channel_stacked)
         lower_layout.addWidget(channel_group, 1)
 
         # --- Right: Common Settings ---
@@ -682,38 +740,8 @@ class MainWindowUI(QMainWindow):
         limit_spin.setSuffix(" A")
         form.addRow("Limit:", limit_spin)
 
-        measure_group = QGroupBox("Measure")
-        measure_form = QFormLayout(measure_group)
-
-        measure_combo = MultiSelectComboBox()
-        measure_combo.add_check_items(["Voltage", "Current", "Resistance"])
-        measure_combo.set_selected_items(["Voltage", "Current"])
-        measure_form.addRow("Items:", measure_combo)
-
-        measure_range_combo = QComboBox()
-        measure_range_combo.addItems(
-            [
-                "Auto",
-                "100 pA",
-                "1 nA",
-                "10 nA",
-                "100 nA",
-                "1 uA",
-                "10 uA",
-                "100 uA",
-                "1 mA",
-                "10 mA",
-                "100 mA",
-                "1 A",
-            ]
-        )
-        measure_form.addRow("Range:", measure_range_combo)
-
-        measure_autozero_combo = QComboBox()
-        measure_autozero_combo.addItems(["On", "Off", "Once"])
-        measure_form.addRow("Auto Zero:", measure_autozero_combo)
-
-        form.addRow(measure_group)
+        measure_popup = MeasurePopupButton()
+        form.addRow("Measure:", measure_popup)
 
         setattr(self, f"function_combo_smu{smu_index}", function_combo)
         setattr(self, f"mode_combo_smu{smu_index}", mode_combo)
@@ -732,9 +760,10 @@ class MainWindowUI(QMainWindow):
         setattr(self, f"stop_spin_smu{smu_index}", stop_spin)
         setattr(self, f"step_display_smu{smu_index}", step_display)
         setattr(self, f"limit_spin_smu{smu_index}", limit_spin)
-        setattr(self, f"measure_combo_smu{smu_index}", measure_combo)
-        setattr(self, f"measure_range_combo_smu{smu_index}", measure_range_combo)
-        setattr(self, f"measure_autozero_combo_smu{smu_index}", measure_autozero_combo)
+        setattr(self, f"measure_popup_smu{smu_index}", measure_popup)
+        setattr(self, f"measure_combo_smu{smu_index}", measure_popup.measure_combo)
+        setattr(self, f"measure_range_combo_smu{smu_index}", measure_popup.measure_range_combo)
+        setattr(self, f"measure_autozero_combo_smu{smu_index}", measure_popup.measure_autozero_combo)
         return page
 
     def _connect_smu_form_signals(self) -> None:
@@ -755,9 +784,7 @@ class MainWindowUI(QMainWindow):
             getattr(self, f"start_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"stop_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"limit_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
-            getattr(self, f"measure_combo_smu{i}").selection_changed.connect(self.emit_config_changed)
-            getattr(self, f"measure_range_combo_smu{i}").currentTextChanged.connect(self.emit_config_changed)
-            getattr(self, f"measure_autozero_combo_smu{i}").currentTextChanged.connect(self.emit_config_changed)
+            getattr(self, f"measure_popup_smu{i}").selection_changed.connect(self.emit_config_changed)
             getattr(self, f"function_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
             getattr(self, f"mode_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
             getattr(self, f"ramp_up_check_smu{i}").stateChanged.connect(self._refresh_dynamic_ui_state)
