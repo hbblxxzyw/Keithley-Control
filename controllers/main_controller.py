@@ -24,7 +24,7 @@ class SweepWorker(QThread):
     data_ready for each acquired point and finished_sweep when done.
     """
 
-    data_ready = Signal(float, float, str)
+    data_ready = Signal(dict)
     finished_sweep = Signal()
 
     def __init__(
@@ -41,6 +41,7 @@ class SweepWorker(QThread):
         p = self.params
 
         primary_name: str = p["primary_name"]
+        stepper_name: str = p["stepper_name"]
         primary_channel: str = p["primary_channel"]
         stepper_channel: str = p["stepper_channel"]
         pri_start: float = p["pri_start"]
@@ -64,59 +65,119 @@ class SweepWorker(QThread):
         ramp_down: bool = p["ramp_down"]
         rd_step: float = p["rd_step"]
         rd_delay: float = p["rd_delay"]
+        measure_cfg: Dict[str, Dict[str, Any]] = p["measure_cfg"]
 
         delay_s = max(0.0, src_meas_delay)
         step_sweep_delay_s = max(0.0, step_sweep_delay)
 
-        def emit_iv_sweep(
-            sweep_start: float,
-            sweep_stop: float,
-            sweep_points: int,
-            use_ramp_up: bool,
-            use_ramp_down: bool,
-            series_name: str,
-        ) -> None:
-            for v_chunk, i_chunk in self.instrument.run_iv_sweep(
-                primary_channel,
-                sweep_start,
-                sweep_stop,
-                sweep_points,
-                delay_s,
-                nplc,
-                primary_limit,
-                use_ramp_up,
-                ru_step,
-                ru_delay,
-                use_ramp_down,
-                rd_step,
-                rd_delay,
-            ):
-                for v, i_val in zip(v_chunk, i_chunk):
-                    self.data_ready.emit(v, i_val, series_name)
+        def build_linear_points(start: float, stop: float, count: int) -> list[float]:
+            if count <= 0:
+                return []
+            if count == 1:
+                return [float(start)]
+            return np.linspace(float(start), float(stop), int(count)).tolist()
 
-        def run_primary_sweep(series_name: str) -> None:
-            emit_iv_sweep(
-                pri_start,
-                pri_stop,
-                points,
-                ramp_up,
-                False if primary_dual else ramp_down,
-                series_name,
+        def build_ramp_points(start: float, stop: float, step_size: float) -> list[float]:
+            distance = abs(float(stop) - float(start))
+            safe_step = max(float(step_size), 1e-9)
+            count = max(2, int(np.ceil(distance / safe_step)) + 1)
+            return build_linear_points(start, stop, count)
+
+        def extend_without_duplicate(base: list[float], extra: list[float]) -> None:
+            if not extra:
+                return
+            if base and abs(base[-1] - extra[0]) < 1e-12:
+                base.extend(extra[1:])
+            else:
+                base.extend(extra)
+
+        def build_primary_sequence() -> list[float]:
+            main_points = build_linear_points(pri_start, pri_stop, points)
+            sequence: list[float] = []
+            if ramp_up and abs(pri_start) > 0:
+                extend_without_duplicate(
+                    sequence,
+                    build_ramp_points(0.0, pri_start, ru_step),
+                )
+            extend_without_duplicate(sequence, main_points)
+            if primary_dual and len(main_points) > 1:
+                extend_without_duplicate(sequence, main_points[-2::-1])
+            end_value = sequence[-1] if sequence else pri_stop
+            if ramp_down and abs(end_value) > 0:
+                extend_without_duplicate(
+                    sequence,
+                    build_ramp_points(end_value, 0.0, rd_step),
+                )
+            return sequence
+
+        def emit_measurement(
+            started_at: float,
+            series_name: str,
+            primary_setpoint: float,
+            stepper_setpoint: float,
+        ) -> None:
+            smu1_values = self.instrument.measure_selected(
+                "smua", list(measure_cfg["smua"]["items"])
+            )
+            smu2_values = self.instrument.measure_selected(
+                "smub", list(measure_cfg["smub"]["items"])
+            )
+            self.data_ready.emit(
+                {
+                    "time_s": time.monotonic() - started_at,
+                    "series_name": series_name,
+                    "primary_name": primary_name,
+                    "stepper_name": stepper_name,
+                    "smu1": {
+                        "source_v": primary_setpoint
+                        if primary_channel == "smua"
+                        else stepper_setpoint,
+                        "values": smu1_values,
+                    },
+                    "smu2": {
+                        "source_v": primary_setpoint
+                        if primary_channel == "smub"
+                        else stepper_setpoint,
+                        "values": smu2_values,
+                    },
+                }
             )
 
-            if primary_dual and points > 1:
-                step_v = (pri_stop - pri_start) / float(points - 1)
-                reverse_start = pri_stop - step_v
-                emit_iv_sweep(
-                    reverse_start,
-                    pri_start,
-                    points - 1,
-                    False,
-                    ramp_down,
-                    series_name,
+        def run_primary_sweep(series_name: str, stepper_setpoint: float) -> None:
+            started_at = time.monotonic()
+            self.instrument.set_voltage_source(primary_channel, pri_start, primary_limit)
+            self.instrument.set_output(primary_channel, True)
+            primary_sequence = build_primary_sequence()
+            for index, primary_value in enumerate(primary_sequence):
+                self.instrument.set_voltage_source(
+                    primary_channel,
+                    float(primary_value),
+                    primary_limit,
                 )
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                emit_measurement(
+                    started_at,
+                    series_name,
+                    float(primary_value),
+                    float(stepper_setpoint),
+                )
+                if index < len(primary_sequence) - 1:
+                    next_value = primary_sequence[index + 1]
+                    if ramp_up and abs(next_value) > abs(primary_value) and ru_delay > 0:
+                        time.sleep(ru_delay)
+                    elif ramp_down and abs(next_value) < abs(primary_value) and rd_delay > 0:
+                        time.sleep(rd_delay)
 
         try:
+            for channel in ("smua", "smub"):
+                self.instrument.configure_measurement(
+                    channel,
+                    list(measure_cfg[channel]["items"]),
+                    str(measure_cfg[channel]["range"]),
+                    str(measure_cfg[channel]["autozero"]),
+                    nplc,
+                )
             if stepper_mode == "fixed":
                 # ----- Branch A: Stepper Fixed → single sweep with bias -----
                 self.instrument.set_voltage_source(
@@ -127,7 +188,7 @@ class SweepWorker(QThread):
                     time.sleep(step_sweep_delay_s)
 
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
-                run_primary_sweep(series_name)
+                run_primary_sweep(series_name, stepper_level)
             else:
                 # ----- Branch B: Stepper Sweep → nested family of curves -----
                 n_stepper = max(1, int(stepper_points_assigned))
@@ -152,7 +213,7 @@ class SweepWorker(QThread):
                         time.sleep(step_sweep_delay_s)
 
                     series_name = f"{primary_name} (Step={step_val:.2f}V)"
-                    run_primary_sweep(series_name)
+                    run_primary_sweep(series_name, float(step_val))
         finally:
             # Ensure outputs are turned off and signal completion
             try:
@@ -398,6 +459,16 @@ class MainController:
                     return f"{step_val * 1e3:.2f} mA"
                 return f"{step_val:.4f} A"
 
+        def format_measure_summary(items: list[str]) -> str:
+            symbol_map = {
+                "Voltage": "V",
+                "Current": "A",
+                "Resistance": "Ohm",
+            }
+            if not items:
+                return "None"
+            return ", ".join(symbol_map.get(item, item) for item in items)
+
         # Compute per-SMU step based on assigned base points (single-direction)
         step1_val = compute_step(start1, stop1, pts1_base) if mode1 == "sweep" else 0.0
         step2_val = compute_step(start2, stop2, pts2_base) if mode2 == "sweep" else 0.0
@@ -414,6 +485,9 @@ class MainController:
         mode1_display = mode1.capitalize() if mode1 else "—"
         self.ui.smu1_function_label.setText(func1 or "—")
         self.ui.smu1_mode_label.setText(mode1_display)
+        self.ui.smu1_measure_label.setText(
+            format_measure_summary(self.ui.measure_combo_smu1.selected_items())
+        )
         if func1 == "Voltage":
             if mode1 == "fixed":
                 self.ui.smu1_source_label.setText(f"Bias Level: {level1:.4g} V")
@@ -454,6 +528,9 @@ class MainController:
         mode2_display = mode2.capitalize() if mode2 else "—"
         self.ui.smu2_function_label.setText(func2 or "—")
         self.ui.smu2_mode_label.setText(mode2_display)
+        self.ui.smu2_measure_label.setText(
+            format_measure_summary(self.ui.measure_combo_smu2.selected_items())
+        )
         if func2 == "Voltage":
             if mode2 == "fixed":
                 self.ui.smu2_source_label.setText(f"Bias Level: {level2:.4g} V")
@@ -703,6 +780,10 @@ class MainController:
         src_meas_delay = float(self.ui.src_meas_delay_spin.value())
         step_sweep_delay = float(self.ui.step_sweep_delay_spin.value())
         nplc = float(self.ui.nplc_spin.value())
+        measure_cfg = {
+            "smua": self.ui.collect_settings()["smu1"]["measure"],
+            "smub": self.ui.collect_settings()["smu2"]["measure"],
+        }
 
         params: Dict[str, Any] = {
             "primary_name": primary_name,
@@ -732,6 +813,7 @@ class MainController:
             "ramp_down": ramp_down,
             "rd_step": rd_step,
             "rd_delay": rd_delay,
+            "measure_cfg": measure_cfg,
         }
 
         # Create and start worker thread
@@ -741,66 +823,52 @@ class MainController:
 
         self.worker.start()
 
-    def handle_new_data_point(
-        self, v: float, i_val: float, series_name: str
-    ) -> None:
+    def handle_new_data_point(self, payload: dict) -> None:
         """
         Slot for SweepWorker.data_ready: update graph and table in the UI thread.
         """
-        # Append to graph
-        self.ui.graph_plot_placeholder.append_data_point(v, i_val, series_name)
+        series_name = str(payload.get("series_name", ""))
+        smu1_values = payload.get("smu1", {}).get("values", {})
+        smu2_values = payload.get("smu2", {}).get("values", {})
 
-        # Parse primary/stepper names and stepper voltage from series_name
-        # Expected formats:
-        #   "SMU 1 (Bias=1.23V)" or "SMU 1 (Step=0.50V)"
-        primary_name = series_name.split(" (", 1)[0].strip()
-        if primary_name == "SMU 1":
-            stepper_name = "SMU 2"
-        else:
-            stepper_name = "SMU 1"
+        if "Voltage" in smu1_values and "Current" in smu1_values:
+            self.ui.graph_plot_placeholder.append_data_point(
+                float(smu1_values["Voltage"]),
+                float(smu1_values["Current"]),
+                f"SMU 1 | {series_name}",
+            )
+        if "Voltage" in smu2_values and "Current" in smu2_values:
+            self.ui.graph_plot_placeholder.append_data_point(
+                float(smu2_values["Voltage"]),
+                float(smu2_values["Current"]),
+                f"SMU 2 | {series_name}",
+            )
 
-        stepper_v = 0.0
-        if "(" in series_name and "=" in series_name:
-            try:
-                inner = series_name.split("(", 1)[1].rstrip(")")
-                # inner like "Bias=1.23V" or "Step=0.50V"
-                val_part = inner.split("=", 1)[1]
-                # strip potential unit at the end
-                val_str = val_part.rstrip("V").strip()
-                stepper_v = float(val_str)
-            except Exception:
-                stepper_v = 0.0
-
-        # Insert into table
         row = self.ui.data_table.rowCount()
         self.ui.data_table.insertRow(row)
-        self._fill_table_row(
-            row, primary_name, v, i_val, stepper_name, stepper_v
-        )
+        self._fill_table_row(row, payload)
 
     def handle_sweep_finished(self) -> None:
         """Restore Run/Abort button state after worker finishes."""
         self.ui.run_btn.setEnabled(True)
         self.ui.abort_btn.setEnabled(False)
 
-    def _fill_table_row(
-        self,
-        row: int,
-        primary_name: str,
-        primary_v: float,
-        primary_i: float,
-        stepper_name: str,
-        stepper_v: float,
-    ) -> None:
-        """Fill one table row: col0=index, col1/2=SMU1 V/I, col3/4=SMU2 V/I."""
-        self.ui.data_table.setItem(row, 0, QTableWidgetItem(f"{row}"))
-        if primary_name == "SMU 1":
-            self.ui.data_table.setItem(row, 1, QTableWidgetItem(f"{primary_v:.6g}"))
-            self.ui.data_table.setItem(row, 2, QTableWidgetItem(f"{primary_i:.6g}"))
-            self.ui.data_table.setItem(row, 3, QTableWidgetItem(f"{stepper_v:.6g}"))
-            self.ui.data_table.setItem(row, 4, QTableWidgetItem(""))
-        else:
-            self.ui.data_table.setItem(row, 1, QTableWidgetItem(f"{stepper_v:.6g}"))
-            self.ui.data_table.setItem(row, 2, QTableWidgetItem(""))
-            self.ui.data_table.setItem(row, 3, QTableWidgetItem(f"{primary_v:.6g}"))
-            self.ui.data_table.setItem(row, 4, QTableWidgetItem(f"{primary_i:.6g}"))
+    def _fill_table_row(self, row: int, payload: dict) -> None:
+        """Fill one table row with measured V/I/R values for both SMUs."""
+        smu1_values = payload.get("smu1", {}).get("values", {})
+        smu2_values = payload.get("smu2", {}).get("values", {})
+
+        def format_value(values: dict, key: str) -> str:
+            if key not in values:
+                return ""
+            return f"{float(values[key]):.6g}"
+
+        self.ui.data_table.setItem(
+            row, 0, QTableWidgetItem(f"{float(payload.get('time_s', 0.0)):.6f}")
+        )
+        self.ui.data_table.setItem(row, 1, QTableWidgetItem(format_value(smu1_values, "Voltage")))
+        self.ui.data_table.setItem(row, 2, QTableWidgetItem(format_value(smu1_values, "Current")))
+        self.ui.data_table.setItem(row, 3, QTableWidgetItem(format_value(smu1_values, "Resistance")))
+        self.ui.data_table.setItem(row, 4, QTableWidgetItem(format_value(smu2_values, "Voltage")))
+        self.ui.data_table.setItem(row, 5, QTableWidgetItem(format_value(smu2_values, "Current")))
+        self.ui.data_table.setItem(row, 6, QTableWidgetItem(format_value(smu2_values, "Resistance")))

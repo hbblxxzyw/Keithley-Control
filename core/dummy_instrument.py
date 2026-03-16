@@ -16,6 +16,9 @@ class DummyKeithley2636(AbstractSMU):
     Use for safe GUI/testing; switch to RealKeithley2636 when ready.
     """
 
+    def __init__(self) -> None:
+        self._source_levels: dict[str, float] = {"smua": 0.0, "smub": 0.0}
+
     def connect(self, resource_str: str) -> bool:
         """Accept any address and report success."""
         return True
@@ -32,11 +35,36 @@ class DummyKeithley2636(AbstractSMU):
         self, smu_channel: str, voltage: float, current_limit: float
     ) -> None:
         """No-op."""
-        pass
+        self._source_levels[smu_channel] = float(voltage)
 
     def measure_current(self, smu_channel: str) -> float:
         """Return a fixed fake current (A)."""
         return 1.23e-6
+
+    def configure_measurement(
+        self,
+        smu_channel: str,
+        measurement_items: list[str],
+        current_range: str,
+        autozero: str,
+        nplc: float,
+    ) -> None:
+        """No-op."""
+        pass
+
+    def measure_selected(
+        self, smu_channel: str, measurement_items: list[str]
+    ) -> dict[str, float]:
+        """Return deterministic fake readings for the selected quantities."""
+        voltage = float(self._source_levels.get(smu_channel, 0.0))
+        current = 1.23e-6 + voltage * 1e-7
+        resistance = voltage / current if abs(current) > 1e-15 else float("inf")
+        values = {
+            "Voltage": voltage,
+            "Current": current,
+            "Resistance": resistance,
+        }
+        return {item: values[item] for item in measurement_items if item in values}
 
     def run_iv_sweep(
         self,

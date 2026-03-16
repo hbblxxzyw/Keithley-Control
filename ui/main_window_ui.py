@@ -5,7 +5,8 @@ Industrial-style layout: configuration and preview in Settings; full-screen
 Graph and Table tabs for measurement data.
 """
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -25,9 +26,58 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QSpinBox,
 )
-from PySide6.QtGui import QFont
 
 from ui.graph_widget import PreviewGraphWidget, MeasurementGraphWidget
+
+
+class MultiSelectComboBox(QComboBox):
+    """A simple checkable combo box for multi-select measurement items."""
+
+    selection_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("Select...")
+        self.view().pressed.connect(self._toggle_item)
+
+    def add_check_items(self, items: list[str]) -> None:
+        for text in items:
+            self.addItem(text)
+            item = self.model().item(self.count() - 1, 0)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            item.setData(Qt.Unchecked, Qt.CheckStateRole)
+        self._refresh_text()
+
+    def _toggle_item(self, index) -> None:
+        item = self.model().itemFromIndex(index)
+        item.setCheckState(
+            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+        )
+        self._refresh_text()
+        self.selection_changed.emit()
+
+    def selected_items(self) -> list[str]:
+        out: list[str] = []
+        for row in range(self.count()):
+            item = self.model().item(row, 0)
+            if item.checkState() == Qt.Checked:
+                out.append(self.itemText(row))
+        return out
+
+    def set_selected_items(self, values: list[str]) -> None:
+        selected = set(values)
+        for row in range(self.count()):
+            item = self.model().item(row, 0)
+            item.setCheckState(
+                Qt.Checked if self.itemText(row) in selected else Qt.Unchecked
+            )
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        selected = self.selected_items()
+        self.lineEdit().setText(", ".join(selected) if selected else "None")
 
 
 class MainWindowUI(QMainWindow):
@@ -117,6 +167,9 @@ class MainWindowUI(QMainWindow):
                     getattr(self, f"start_spin_smu{i}"),
                     getattr(self, f"stop_spin_smu{i}"),
                     getattr(self, f"limit_spin_smu{i}"),
+                    getattr(self, f"measure_combo_smu{i}"),
+                    getattr(self, f"measure_range_combo_smu{i}"),
+                    getattr(self, f"measure_autozero_combo_smu{i}"),
                 ]
             )
         return widgets
@@ -158,6 +211,17 @@ class MainWindowUI(QMainWindow):
             "start": float(getattr(self, f"start_spin_smu{smu_index}").value()),
             "stop": float(getattr(self, f"stop_spin_smu{smu_index}").value()),
             "limit": float(getattr(self, f"limit_spin_smu{smu_index}").value()),
+            "measure": {
+                "items": list(
+                    getattr(self, f"measure_combo_smu{smu_index}").selected_items()
+                ),
+                "range": str(
+                    getattr(self, f"measure_range_combo_smu{smu_index}").currentText()
+                ),
+                "autozero": str(
+                    getattr(self, f"measure_autozero_combo_smu{smu_index}").currentText()
+                ),
+            },
         }
 
     def apply_settings(self, settings: dict) -> None:
@@ -216,6 +280,26 @@ class MainWindowUI(QMainWindow):
                 )
                 getattr(self, f"limit_spin_smu{smu_index}").setValue(
                     float(smu_cfg.get("limit", getattr(self, f"limit_spin_smu{smu_index}").value()))
+                )
+                measure_cfg = smu_cfg.get("measure", {})
+                getattr(self, f"measure_combo_smu{smu_index}").set_selected_items(
+                    list(measure_cfg.get("items", ["Voltage", "Current"]))
+                )
+                getattr(self, f"measure_range_combo_smu{smu_index}").setCurrentText(
+                    str(
+                        measure_cfg.get(
+                            "range",
+                            getattr(self, f"measure_range_combo_smu{smu_index}").currentText(),
+                        )
+                    )
+                )
+                getattr(self, f"measure_autozero_combo_smu{smu_index}").setCurrentText(
+                    str(
+                        measure_cfg.get(
+                            "autozero",
+                            getattr(self, f"measure_autozero_combo_smu{smu_index}").currentText(),
+                        )
+                    )
                 )
 
             self._refresh_dynamic_ui_state()
@@ -350,11 +434,13 @@ class MainWindowUI(QMainWindow):
         self.smu1_mode_label = QLabel("—")
         self.smu1_source_label = QLabel("—")
         self.smu1_limit_label = QLabel("—")
+        self.smu1_measure_label = QLabel("—")
         self.smu1_ramp_label = QLabel("—")
         smu1_layout.addRow("Function:", self.smu1_function_label)
         smu1_layout.addRow("Mode:", self.smu1_mode_label)
         smu1_layout.addRow("Source:", self.smu1_source_label)
         smu1_layout.addRow("Limit:", self.smu1_limit_label)
+        smu1_layout.addRow("Measure:", self.smu1_measure_label)
         smu1_layout.addRow("Ramp:", self.smu1_ramp_label)
         summary_layout.addWidget(smu1_group)
 
@@ -365,11 +451,13 @@ class MainWindowUI(QMainWindow):
         self.smu2_mode_label = QLabel("—")
         self.smu2_source_label = QLabel("—")
         self.smu2_limit_label = QLabel("—")
+        self.smu2_measure_label = QLabel("—")
         self.smu2_ramp_label = QLabel("—")
         smu2_layout.addRow("Function:", self.smu2_function_label)
         smu2_layout.addRow("Mode:", self.smu2_mode_label)
         smu2_layout.addRow("Source:", self.smu2_source_label)
         smu2_layout.addRow("Limit:", self.smu2_limit_label)
+        smu2_layout.addRow("Measure:", self.smu2_measure_label)
         smu2_layout.addRow("Ramp:", self.smu2_ramp_label)
         summary_layout.addWidget(smu2_group)
 
@@ -587,6 +675,39 @@ class MainWindowUI(QMainWindow):
         limit_spin.setSuffix(" A")
         form.addRow("Limit:", limit_spin)
 
+        measure_group = QGroupBox("Measure")
+        measure_form = QFormLayout(measure_group)
+
+        measure_combo = MultiSelectComboBox()
+        measure_combo.add_check_items(["Voltage", "Current", "Resistance"])
+        measure_combo.set_selected_items(["Voltage", "Current"])
+        measure_form.addRow("Items:", measure_combo)
+
+        measure_range_combo = QComboBox()
+        measure_range_combo.addItems(
+            [
+                "Auto",
+                "100 pA",
+                "1 nA",
+                "10 nA",
+                "100 nA",
+                "1 uA",
+                "10 uA",
+                "100 uA",
+                "1 mA",
+                "10 mA",
+                "100 mA",
+                "1 A",
+            ]
+        )
+        measure_form.addRow("Range:", measure_range_combo)
+
+        measure_autozero_combo = QComboBox()
+        measure_autozero_combo.addItems(["On", "Off", "Once"])
+        measure_form.addRow("Auto Zero:", measure_autozero_combo)
+
+        form.addRow(measure_group)
+
         setattr(self, f"function_combo_smu{smu_index}", function_combo)
         setattr(self, f"mode_combo_smu{smu_index}", mode_combo)
         setattr(self, f"dual_sweep_check_smu{smu_index}", dual_sweep_check)
@@ -604,6 +725,9 @@ class MainWindowUI(QMainWindow):
         setattr(self, f"stop_spin_smu{smu_index}", stop_spin)
         setattr(self, f"step_display_smu{smu_index}", step_display)
         setattr(self, f"limit_spin_smu{smu_index}", limit_spin)
+        setattr(self, f"measure_combo_smu{smu_index}", measure_combo)
+        setattr(self, f"measure_range_combo_smu{smu_index}", measure_range_combo)
+        setattr(self, f"measure_autozero_combo_smu{smu_index}", measure_autozero_combo)
         return page
 
     def _connect_smu_form_signals(self) -> None:
@@ -624,6 +748,9 @@ class MainWindowUI(QMainWindow):
             getattr(self, f"start_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"stop_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"limit_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
+            getattr(self, f"measure_combo_smu{i}").selection_changed.connect(self.emit_config_changed)
+            getattr(self, f"measure_range_combo_smu{i}").currentTextChanged.connect(self.emit_config_changed)
+            getattr(self, f"measure_autozero_combo_smu{i}").currentTextChanged.connect(self.emit_config_changed)
             getattr(self, f"function_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
             getattr(self, f"mode_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
             getattr(self, f"ramp_up_check_smu{i}").stateChanged.connect(self._refresh_dynamic_ui_state)
@@ -655,13 +782,15 @@ class MainWindowUI(QMainWindow):
         layout = QVBoxLayout(self.table_tab)
 
         self.data_table = QTableWidget()
-        self.data_table.setColumnCount(5)
+        self.data_table.setColumnCount(7)
         self.data_table.setHorizontalHeaderLabels([
             "Time (s)",
             "SMU 1 V",
             "SMU 1 I",
+            "SMU 1 R",
             "SMU 2 V",
             "SMU 2 I",
+            "SMU 2 R",
         ])
         self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.data_table)

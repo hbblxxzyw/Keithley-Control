@@ -80,6 +80,43 @@ class AbstractSMU(ABC):
         pass
 
     @abstractmethod
+    def configure_measurement(
+        self,
+        smu_channel: str,
+        measurement_items: list[str],
+        current_range: str,
+        autozero: str,
+        nplc: float,
+    ) -> None:
+        """
+        Configure measurement parameters for the specified channel.
+
+        Args:
+            smu_channel: Channel identifier, either 'smua' or 'smub'.
+            measurement_items: Selected measurement quantities.
+            current_range: Current range label such as 'Auto' or '1 mA'.
+            autozero: Autozero mode label such as 'On', 'Off', or 'Once'.
+            nplc: Integration time in PLC.
+        """
+        pass
+
+    @abstractmethod
+    def measure_selected(
+        self, smu_channel: str, measurement_items: list[str]
+    ) -> dict[str, float]:
+        """
+        Measure the selected quantities on the specified channel.
+
+        Args:
+            smu_channel: Channel identifier, either 'smua' or 'smub'.
+            measurement_items: Selected measurement quantities.
+
+        Returns:
+            A mapping from quantity name to measured value.
+        """
+        pass
+
+    @abstractmethod
     def run_iv_sweep(
         self,
         smu_channel: str,

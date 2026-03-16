@@ -40,6 +40,7 @@ class RealKeithley2636(AbstractSMU):
         self._rm = pyvisa.ResourceManager()
         self._resource = None
         self._current_limits: dict[str, float] = {}
+        self._source_levels: dict[str, float] = {"smua": 0.0, "smub": 0.0}
 
     def _send_cmd(self, cmd: str) -> None:
         """
@@ -135,6 +136,7 @@ class RealKeithley2636(AbstractSMU):
         self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
         self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
         self._send_cmd(f"{smu_channel}.source.limiti = {current_limit}")
+        self._source_levels[smu_channel] = float(voltage)
         if current_limit > 0:
             self._current_limits[smu_channel] = float(current_limit)
 
@@ -142,6 +144,97 @@ class RealKeithley2636(AbstractSMU):
         """Single current measurement on the given channel; TSP uses print to return value."""
         reply = self._query_cmd(f"print({smu_channel}.measure.i())")
         return float(reply)
+
+    def _measurement_range_amps(self, current_range: str) -> float | None:
+        range_map = {
+            "100 pA": 100e-12,
+            "1 nA": 1e-9,
+            "10 nA": 10e-9,
+            "100 nA": 100e-9,
+            "1 uA": 1e-6,
+            "10 uA": 10e-6,
+            "100 uA": 100e-6,
+            "1 mA": 1e-3,
+            "10 mA": 10e-3,
+            "100 mA": 100e-3,
+            "1 A": 1.0,
+        }
+        return range_map.get(str(current_range or "").strip())
+
+    def configure_measurement(
+        self,
+        smu_channel: str,
+        measurement_items: list[str],
+        current_range: str,
+        autozero: str,
+        nplc: float,
+    ) -> None:
+        """Configure measurement aperture, current range, and autozero."""
+        if not measurement_items:
+            return
+
+        autozero_map = {
+            "off": "AUTOZERO_OFF",
+            "once": "AUTOZERO_ONCE",
+            "on": "AUTOZERO_AUTO",
+            "auto": "AUTOZERO_AUTO",
+        }
+        autozero_token = autozero_map.get(
+            str(autozero or "").strip().lower(),
+            "AUTOZERO_AUTO",
+        )
+
+        self._send_cmd(f"{smu_channel}.measure.nplc = {float(nplc)}")
+        self._send_cmd(
+            f"{smu_channel}.measure.autozero = {smu_channel}.{autozero_token}"
+        )
+        self._send_cmd(
+            f"{smu_channel}.measure.filter.enable = {smu_channel}.FILTER_OFF"
+        )
+
+        range_amps = self._measurement_range_amps(current_range)
+        if range_amps is None:
+            self._send_cmd(
+                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON"
+            )
+        else:
+            self._send_cmd(
+                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF"
+            )
+            self._send_cmd(f"{smu_channel}.measure.rangei = {range_amps}")
+
+    def measure_selected(
+        self, smu_channel: str, measurement_items: list[str]
+    ) -> dict[str, float]:
+        """Measure selected quantities using TSP measure helpers."""
+        command_map = {
+            "Voltage": "v",
+            "Current": "i",
+            "Resistance": "r",
+        }
+        if self.debug:
+            voltage = float(self._source_levels.get(smu_channel, 0.0))
+            current = 1.23e-6 + voltage * 1e-7
+            resistance = voltage / current if abs(current) > 1e-15 else float("inf")
+            fake_values = {
+                "Voltage": voltage,
+                "Current": current,
+                "Resistance": resistance,
+            }
+            return {
+                item: fake_values[item]
+                for item in measurement_items
+                if item in fake_values
+            }
+
+        out: dict[str, float] = {}
+        for item in measurement_items:
+            cmd_suffix = command_map.get(item)
+            if not cmd_suffix:
+                continue
+            reply = self._query_cmd(f"print({smu_channel}.measure.{cmd_suffix}())")
+            out[item] = float(reply)
+        return out
 
     def run_iv_sweep(
         self,
