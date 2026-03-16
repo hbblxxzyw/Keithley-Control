@@ -31,6 +31,7 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_POLL_INTERVAL_S = 0.1
     MIN_CHUNK_POINTS = 5
     MEASURE_EVERY_N_POINTS = 3
+    DEFAULT_RESOURCE_ENCODING = "latin-1"
 
     def __init__(self, debug: bool = False) -> None:
         """
@@ -65,13 +66,37 @@ class RealKeithley2636(AbstractSMU):
         Send a TSP command and read the response string.
 
         In debug mode returns fixed fake data (e.g. '1.23e-6'); otherwise
-        uses PyVISA query for write+read.
+        uses raw write+read with tolerant decoding.
         """
         if self.debug:
             return "1.23e-6"
         if self._resource is None:
             raise RuntimeError("Instrument not connected; call connect() first.")
-        return self._resource.query(cmd).strip()
+        self._resource.write(cmd)
+        return self._read_response().strip()
+
+    def _read_response(self) -> str:
+        """Read one raw response and decode it robustly."""
+        if self._resource is None:
+            raise RuntimeError("Instrument not connected; call connect() first.")
+
+        raw = self._resource.read_raw()
+        if not raw:
+            return ""
+
+        for encoding, errors in (
+            ("utf-8", "strict"),
+            (self.DEFAULT_RESOURCE_ENCODING, "strict"),
+            ("ascii", "ignore"),
+        ):
+            try:
+                return raw.decode(encoding, errors=errors).strip("\x00\r\n ")
+            except UnicodeDecodeError:
+                continue
+
+        return raw.decode(self.DEFAULT_RESOURCE_ENCODING, errors="replace").strip(
+            "\x00\r\n "
+        )
 
     def connect(self, resource_str: str) -> bool:
         """
@@ -84,6 +109,7 @@ class RealKeithley2636(AbstractSMU):
         try:
             self._resource = self._rm.open_resource(resource_str)
             self._resource.timeout = self.DEFAULT_TIMEOUT_MS
+            self._resource.encoding = self.DEFAULT_RESOURCE_ENCODING
 
             # 设置 TSP 协议必需的指令终止符
             self._resource.read_termination = "\n"
