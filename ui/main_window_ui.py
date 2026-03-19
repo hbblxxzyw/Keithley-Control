@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QMenu,
     QWidgetAction,
+    QSizePolicy,
 )
 
 from ui.graph_widget import PreviewGraphWidget, MeasurementGraphWidget
@@ -475,13 +476,17 @@ class MainWindowUI(QMainWindow):
 
         # ---------- Upper: Output Preview ----------
         preview_group = QGroupBox("Output Preview")
+        preview_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+        preview_layout.setSpacing(0)
 
         # Preview waveform (Settings tab)
         self.preview_plot_placeholder = PreviewGraphWidget()
-        self.preview_plot_placeholder.setMinimumHeight(120)
-        self.preview_plot_placeholder.setMaximumHeight(160)
+        self.preview_plot_placeholder.setMinimumHeight(140)
+        self.preview_plot_placeholder.setMaximumHeight(140)
         preview_layout.addWidget(self.preview_plot_placeholder)
+        preview_group.setFixedHeight(preview_group.sizeHint().height())
 
         layout.addWidget(preview_group)
 
@@ -635,6 +640,7 @@ class MainWindowUI(QMainWindow):
         lower_layout.addWidget(common_group, 1)
 
         layout.addLayout(lower_layout)
+        layout.addStretch(1)
         self._connect_smu_form_signals()
 
     def _build_smu_form_page(self, smu_index: int) -> QWidget:

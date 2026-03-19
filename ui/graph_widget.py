@@ -7,6 +7,25 @@ import pyqtgraph as pg
 from pyqtgraph import PlotDataItem
 
 
+class PlainAxisItem(pg.AxisItem):
+    """Axis item that always renders plain values without SI scaling."""
+
+    def __init__(self, orientation: str, suffix: str = "") -> None:
+        super().__init__(orientation=orientation)
+        self._suffix = suffix
+        self.enableAutoSIPrefix(False)
+
+    def tickStrings(self, values, scale, spacing):  # type: ignore[override]
+        labels: list[str] = []
+        decimals = 3 if spacing < 1 else 2
+        for value in values:
+            text = f"{float(value):.{decimals}f}".rstrip("0").rstrip(".")
+            if text == "-0":
+                text = "0"
+            labels.append(f"{text}{self._suffix}")
+        return labels
+
+
 class PreviewGraphWidget(pg.GraphicsLayoutWidget):
     """
     Preview widget for the Settings tab: two stacked plots (SMU 1 / SMU 2).
@@ -18,22 +37,54 @@ class PreviewGraphWidget(pg.GraphicsLayoutWidget):
 
     def __init__(self, parent=None, **kwargs) -> None:
         super().__init__(parent=parent, **kwargs)
-        self.setBackground("#2b2b2b")
+        self.setBackground("w")
+        self.setContentsMargins(0, 0, 0, 0)
+        self.ci.layout.setContentsMargins(4, 4, 4, 4)
+        self.ci.layout.setSpacing(2)
 
-        # Top: SMU 1 (red), hide X axis labels to save space
-        self.plot_smu1 = self.addPlot(row=0, col=0)
-        self.plot_smu1.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_smu1.setLabel("left", "SMU 1 Amp")
+        preview_axes = {
+            "bottom": PlainAxisItem("bottom", suffix="s"),
+            "left": PlainAxisItem("left"),
+        }
+
+        # Top: SMU 1 (red), hide X tick labels to save space
+        self.plot_smu1 = self.addPlot(row=0, col=0, axisItems=preview_axes)
+        self.plot_smu1.showGrid(x=True, y=True, alpha=0.12)
+        self.plot_smu1.showAxis("top", False)
+        self.plot_smu1.showAxis("right", False)
+        self.plot_smu1.getAxis("left").setTextPen("#5f6368")
+        self.plot_smu1.getAxis("bottom").setTextPen("#5f6368")
+        self.plot_smu1.getAxis("left").setPen("#d0d7de")
+        self.plot_smu1.getAxis("bottom").setPen("#d0d7de")
         self.plot_smu1.getAxis("bottom").setStyle(showValues=False)
+        self.plot_smu1.setMenuEnabled(False)
+        self.plot_smu1.setMouseEnabled(x=False, y=False)
+        self.plot_smu1.setContentsMargins(0, 0, 0, 0)
+        self.plot_smu1.getViewBox().setDefaultPadding(0.02)
         self.line_smu1 = self.plot_smu1.plot(pen=pg.mkPen("r", width=2))
         self.line_smu1.setData([], [])
 
-        # Bottom: SMU 2 (blue), shared X axis label, linked to plot_smu1
-        self.plot_smu2 = self.addPlot(row=1, col=0)
+        # Bottom: SMU 2 (blue), linked to plot_smu1
+        self.plot_smu2 = self.addPlot(
+            row=1,
+            col=0,
+            axisItems={
+                "bottom": PlainAxisItem("bottom", suffix="s"),
+                "left": PlainAxisItem("left"),
+            },
+        )
         self.plot_smu2.setXLink(self.plot_smu1)
-        self.plot_smu2.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_smu2.setLabel("left", "SMU 2 Amp")
-        self.plot_smu2.setLabel("bottom", "Time (s)")
+        self.plot_smu2.showGrid(x=True, y=True, alpha=0.12)
+        self.plot_smu2.showAxis("top", False)
+        self.plot_smu2.showAxis("right", False)
+        self.plot_smu2.getAxis("left").setTextPen("#5f6368")
+        self.plot_smu2.getAxis("bottom").setTextPen("#5f6368")
+        self.plot_smu2.getAxis("left").setPen("#d0d7de")
+        self.plot_smu2.getAxis("bottom").setPen("#d0d7de")
+        self.plot_smu2.setMenuEnabled(False)
+        self.plot_smu2.setMouseEnabled(x=False, y=False)
+        self.plot_smu2.setContentsMargins(0, 0, 0, 0)
+        self.plot_smu2.getViewBox().setDefaultPadding(0.02)
         self.line_smu2 = self.plot_smu2.plot(pen=pg.mkPen("b", width=2))
         self.line_smu2.setData([], [])
 

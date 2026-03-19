@@ -467,6 +467,11 @@ class RealKeithley2636(AbstractSMU):
                     yield v_chunk[:n_chunk], i_chunk[:n_chunk]
                 old_n = current_n
 
+            # The buffer can reach target_n a few milliseconds before the
+            # Trigger Model has fully unwound back to IDLE. Synchronize here
+            # so the next block does not reconfigure the SMU mid-sweep.
+            self._query_cmd("waitcomplete() print('1')")
+
         # ================= Three steps sequentially execution =================
 
         # Step A：Ramp Up
