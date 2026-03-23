@@ -448,9 +448,8 @@ class RealKeithley2636(AbstractSMU):
                 old_n += block_pts
                 return
 
-            # Keep the static source level aligned with the next block's first
-            # point so the SMU does not briefly snap back to the previous idle
-            # level (typically 0 V) between consecutive trigger blocks.
+            # Prime the static source level with the first point so the block
+            # starts from the expected voltage when the trigger model begins.
             self._send_cmd(f"{smu_channel}.source.levelv = {v_start}")
             self._source_levels[smu_channel] = float(v_start)
             # Set specific step delay (e.g. ru_delay, delay, rd_delay)
@@ -472,6 +471,12 @@ class RealKeithley2636(AbstractSMU):
             
             # Start hardware scan
             self._send_cmd(f"{smu_channel}.trigger.initiate()")
+            # When the trigger block completes, the SMU falls back to the
+            # static source level. Preload the block's terminal value here so
+            # ramp-up ends holding at start_v of the main sweep instead of
+            # snapping back to 0 V.
+            self._send_cmd(f"{smu_channel}.source.levelv = {v_stop}")
+            self._source_levels[smu_channel] = float(v_stop)
 
             # poll and pull incremental data for this block
             block_base_n = old_n

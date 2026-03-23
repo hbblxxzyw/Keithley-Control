@@ -170,12 +170,20 @@ class MeasurementGraphWidget(pg.PlotWidget):
         if key not in self._series:
             palette = self._palette.get(smu_name, ["#424242"])
             color_idx = self._color_index.get(smu_name, 0)
+            color = palette[color_idx % len(palette)]
             pen = pg.mkPen(
-                palette[color_idx % len(palette)],
+                color,
                 width=2,
             )
             self._color_index[smu_name] = color_idx + 1
-            curve = self.plot(pen=pen, name=f"{smu_name} | {series_name}")
+            curve = self.plot(
+                pen=pen,
+                name=f"{smu_name} | {series_name}",
+                symbol="o",
+                symbolSize=7,
+                symbolBrush=pg.mkBrush(color),
+                symbolPen=pg.mkPen(color, width=1),
+            )
             self._series[key] = curve
             self._data[key] = ([], [])
             curve.setData([], [])
