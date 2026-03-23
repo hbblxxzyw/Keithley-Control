@@ -133,7 +133,17 @@ class AbstractSMU(ABC):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float],
+            list[float] | None,
+            list[float],
+            list[float] | None,
+        ],
+        None,
+        None,
+    ]:
         """
         Run a linear voltage sweep (IV sweep) on the specified channel.
 
@@ -161,10 +171,8 @@ class AbstractSMU(ABC):
             rd_delay: Ramp-down step delay in s.
 
         Yields:
-            Tuples (source_voltages, currents, measured_voltages) for each chunk:
-            - voltages: List of actual source voltages (may include ramp points).
-            - currents: List of corresponding currents, same length as voltages.
-            - measured_voltages: Optional list of measured voltages, same length
-              as voltages when available; otherwise None.
+            Tuples
+            (source_voltages, primary_currents, primary_measured_voltages,
+            secondary_currents, secondary_measured_voltages) for each chunk.
         """
         pass

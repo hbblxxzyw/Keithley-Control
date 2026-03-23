@@ -86,16 +86,39 @@ class DummyKeithley2636(AbstractSMU):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float],
+            list[float] | None,
+            list[float],
+            list[float] | None,
+        ],
+        None,
+        None,
+    ]:
         """Yield one chunk of linear voltage sweep and fake currents."""
         if points < 1:
             return
+        secondary_channel = "smub" if smu_channel == "smua" else "smua"
         step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
         voltages = [start_v + i * step for i in range(points)]
         currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
+        secondary_voltage = float(self._source_levels.get(secondary_channel, 0.0))
+        secondary_currents = [
+            8.9e-7 + secondary_voltage * 8e-8 + index * 1e-9
+            for index in range(points)
+        ]
         measured_voltages = None
+        secondary_measured_voltages = None
         if measurement_items and any(
             item in {"Voltage", "Resistance"} for item in measurement_items
         ):
             measured_voltages = list(voltages)
-        yield voltages, currents, measured_voltages
+        yield (
+            voltages,
+            currents,
+            measured_voltages,
+            secondary_currents,
+            secondary_measured_voltages,
+        )

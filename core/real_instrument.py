@@ -352,7 +352,17 @@ class RealKeithley2636(AbstractSMU):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float],
+            list[float] | None,
+            list[float],
+            list[float] | None,
+        ],
+        None,
+        None,
+    ]:
         """
         Run a linear voltage sweep using the instrument's Trigger Model.
 
@@ -365,11 +375,18 @@ class RealKeithley2636(AbstractSMU):
         if points < 1:
             return
 
+        secondary_channel = "smub" if smu_channel == "smua" else "smua"
         sweep_current_limit = current_limit
         if sweep_current_limit is None:
             sweep_current_limit = self._current_limits.get(smu_channel)
         requested_measurements = set(measurement_items or [])
         capture_voltage = bool({"Voltage", "Resistance"} & requested_measurements)
+        secondary_measurements = set(
+            self._measure_state.get(secondary_channel, {}).get("signature", ())
+        )
+        capture_secondary_voltage = bool(
+            {"Voltage", "Resistance"} & secondary_measurements
+        )
 
         def _parse_buffer(reply: str) -> list[float]:
             parts = [p.strip() for p in reply.split(",") if p.strip()]
@@ -393,22 +410,22 @@ class RealKeithley2636(AbstractSMU):
             step_v = (v_stop - v_start) / (total_points - 1)
             return [v_start + (idx - 1) * step_v for idx in range(start_point, end_point + 1)]
 
-        def _configure_fast_measurement(limit_amps: float | None) -> None:
-            self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
+        def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
+            self._send_cmd(f"{channel}.measure.nplc = {nplc}")
             self._send_cmd(
-                f"{smu_channel}.measure.autozero = {smu_channel}.AUTOZERO_OFF"
+                f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF"
             )
             self._send_cmd(
-                f"{smu_channel}.measure.filter.enable = {smu_channel}.FILTER_OFF"
+                f"{channel}.measure.filter.enable = {channel}.FILTER_OFF"
             )
             if limit_amps is not None and limit_amps > 0:
                 self._send_cmd(
-                    f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF"
+                    f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF"
                 )
-                self._send_cmd(f"{smu_channel}.measure.rangei = {abs(limit_amps)}")
+                self._send_cmd(f"{channel}.measure.rangei = {abs(limit_amps)}")
             else:
                 self._send_cmd(
-                    f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON"
+                    f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON"
                 )
 
         # 1) Force the sweep channel to a known 0 V state before enabling output.
@@ -426,7 +443,16 @@ class RealKeithley2636(AbstractSMU):
         if capture_voltage:
             self._send_cmd(f"{smu_channel}.nvbuffer2.clear()")
             self._send_cmd(f"{smu_channel}.nvbuffer2.appendmode = 1")
-        _configure_fast_measurement(sweep_current_limit)
+        self._send_cmd(f"{secondary_channel}.nvbuffer1.clear()")
+        self._send_cmd(f"{secondary_channel}.nvbuffer1.appendmode = 1")
+        if capture_secondary_voltage:
+            self._send_cmd(f"{secondary_channel}.nvbuffer2.clear()")
+            self._send_cmd(f"{secondary_channel}.nvbuffer2.appendmode = 1")
+        _configure_fast_measurement(smu_channel, sweep_current_limit)
+        _configure_fast_measurement(
+            secondary_channel,
+            self._current_limits.get(secondary_channel),
+        )
 
         # 4) Poll and yield incremental chunks (no fixed sleep)
         old_n = 0
@@ -443,8 +469,19 @@ class RealKeithley2636(AbstractSMU):
                 step_v = (v_stop - v_start) / (block_pts - 1) if block_pts > 1 else 0.0
                 v_chunk = [v_start + i * step_v for i in range(block_pts)]
                 i_chunk = [1.23e-6 + (v - v_start) * 1e-7 for v in v_chunk]
+                sec_i_chunk = [
+                    8.9e-7
+                    + float(self._source_levels.get(secondary_channel, 0.0)) * 8e-8
+                    + index * 1e-9
+                    for index in range(block_pts)
+                ]
                 measured_v_chunk = list(v_chunk) if capture_voltage else None
-                yield v_chunk, i_chunk, measured_v_chunk
+                sec_v_chunk = (
+                    [float(self._source_levels.get(secondary_channel, 0.0))] * block_pts
+                    if capture_secondary_voltage
+                    else None
+                )
+                yield v_chunk, i_chunk, measured_v_chunk, sec_i_chunk, sec_v_chunk
                 old_n += block_pts
                 return
 
@@ -455,7 +492,9 @@ class RealKeithley2636(AbstractSMU):
             # Set specific step delay (e.g. ru_delay, delay, rd_delay)
             self._send_cmd(f"{smu_channel}.source.delay = {block_delay}")
             
-            # Configure Trigger Model parameters
+            # Configure Trigger Model parameters for synchronous dual-channel capture.
+            self._send_cmd(f"{smu_channel}.trigger.clear()")
+            self._send_cmd(f"{secondary_channel}.trigger.clear()")
             self._send_cmd(f"{smu_channel}.trigger.source.linearv({v_start}, {v_stop}, {block_pts})")
             self._send_cmd(f"{smu_channel}.trigger.source.action = {smu_channel}.ENABLE")
             if capture_voltage:
@@ -465,11 +504,29 @@ class RealKeithley2636(AbstractSMU):
             else:
                 self._send_cmd(f"{smu_channel}.trigger.measure.i({smu_channel}.nvbuffer1)")
             self._send_cmd(f"{smu_channel}.trigger.measure.action = {smu_channel}.ENABLE")
+            if capture_secondary_voltage:
+                self._send_cmd(
+                    f"{secondary_channel}.trigger.measure.iv({secondary_channel}.nvbuffer1, {secondary_channel}.nvbuffer2)"
+                )
+            else:
+                self._send_cmd(
+                    f"{secondary_channel}.trigger.measure.i({secondary_channel}.nvbuffer1)"
+                )
+            self._send_cmd(
+                f"{secondary_channel}.trigger.measure.action = {secondary_channel}.ENABLE"
+            )
             self._send_cmd(f"{smu_channel}.trigger.count = {block_pts}")
+            self._send_cmd(f"{secondary_channel}.trigger.count = {block_pts}")
             self._send_cmd(f"{smu_channel}.trigger.source.stimulus = 0")
-            self._send_cmd(f"{smu_channel}.trigger.measure.stimulus = 0")
+            self._send_cmd(
+                f"{smu_channel}.trigger.measure.stimulus = {smu_channel}.trigger.SOURCE_COMPLETE_EVENT_ID"
+            )
+            self._send_cmd(
+                f"{secondary_channel}.trigger.measure.stimulus = {smu_channel}.trigger.SOURCE_COMPLETE_EVENT_ID"
+            )
             
             # Start hardware scan
+            self._send_cmd(f"{secondary_channel}.trigger.initiate()")
             self._send_cmd(f"{smu_channel}.trigger.initiate()")
             # When the trigger block completes, the SMU falls back to the
             # static source level. Preload the block's terminal value here so
@@ -496,9 +553,13 @@ class RealKeithley2636(AbstractSMU):
                 # Pull only new data: indices old_n+1 .. current_n (1-based in TSP)
                 reply_i = self._query_cmd(
                     f"printbuffer({old_n + 1}, {current_n}, "
-                    f"{smu_channel}.nvbuffer1.readings)"
+                    f"{smu_channel}.nvbuffer1.readings, "
+                    f"{secondary_channel}.nvbuffer1.readings)"
                 )
-                i_chunk = _parse_buffer(reply_i)
+                combined_currents = _parse_buffer(reply_i)
+                split_at = current_n - old_n
+                i_chunk = combined_currents[:split_at]
+                sec_i_chunk = combined_currents[split_at : split_at * 2]
                 measured_v_chunk = None
                 if capture_voltage:
                     reply_v = self._query_cmd(
@@ -506,6 +567,13 @@ class RealKeithley2636(AbstractSMU):
                         f"{smu_channel}.nvbuffer2.readings)"
                     )
                     measured_v_chunk = _parse_buffer(reply_v)
+                sec_v_chunk = None
+                if capture_secondary_voltage:
+                    reply_sec_v = self._query_cmd(
+                        f"printbuffer({old_n + 1}, {current_n}, "
+                        f"{secondary_channel}.nvbuffer2.readings)"
+                    )
+                    sec_v_chunk = _parse_buffer(reply_sec_v)
                 start_point = old_n - block_base_n + 1
                 end_point = current_n - block_base_n
                 v_chunk = _linear_chunk_values(
@@ -515,14 +583,18 @@ class RealKeithley2636(AbstractSMU):
                     start_point,
                     end_point,
                 )
-                n_chunk = min(len(v_chunk), len(i_chunk))
+                n_chunk = min(len(v_chunk), len(i_chunk), len(sec_i_chunk))
                 if measured_v_chunk is not None:
                     n_chunk = min(n_chunk, len(measured_v_chunk))
+                if sec_v_chunk is not None:
+                    n_chunk = min(n_chunk, len(sec_v_chunk))
                 if n_chunk > 0:
                     yield (
                         v_chunk[:n_chunk],
                         i_chunk[:n_chunk],
                         None if measured_v_chunk is None else measured_v_chunk[:n_chunk],
+                        sec_i_chunk[:n_chunk],
+                        None if sec_v_chunk is None else sec_v_chunk[:n_chunk],
                     )
                 old_n = current_n
 

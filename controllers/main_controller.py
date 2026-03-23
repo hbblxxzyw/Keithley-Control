@@ -27,8 +27,6 @@ class SweepWorker(QThread):
 
     data_ready = Signal(dict)
     finished_sweep = Signal()
-    SECONDARY_MEASURE_EVERY_CHUNK = True
-
     def __init__(
         self,
         instrument: AbstractSMU,
@@ -97,15 +95,33 @@ class SweepWorker(QThread):
                 values_per_point.append(point_values)
             return values_per_point
 
-        def secondary_channel_name() -> str:
-            return "smub" if primary_channel == "smua" else "smua"
-
-        def measure_secondary_chunk() -> dict[str, float]:
-            secondary_channel = secondary_channel_name()
-            return self.instrument.measure_selected(
-                secondary_channel,
-                list(measure_cfg[secondary_channel]["items"]),
-            )
+        def build_secondary_values(
+            current_values: list[float],
+            measured_voltage_values: list[float] | None,
+            stepper_setpoint: float,
+        ) -> list[dict[str, float]]:
+            values_per_point: list[dict[str, float]] = []
+            secondary_channel = "smub" if primary_channel == "smua" else "smua"
+            requested_items = list(measure_cfg[secondary_channel]["items"])
+            for index, current in enumerate(current_values):
+                measured_voltage = None
+                if measured_voltage_values is not None and index < len(measured_voltage_values):
+                    measured_voltage = float(measured_voltage_values[index])
+                point_voltage = (
+                    measured_voltage
+                    if measured_voltage is not None
+                    else float(stepper_setpoint)
+                )
+                point_values: dict[str, float] = {"Voltage": point_voltage}
+                if "Current" in requested_items:
+                    point_values["Current"] = float(current)
+                if "Resistance" in requested_items:
+                    if abs(current) > 1e-15:
+                        point_values["Resistance"] = point_voltage / float(current)
+                    else:
+                        point_values["Resistance"] = float("inf")
+                values_per_point.append(point_values)
+            return values_per_point
 
         def build_payload(
             started_at: float,
@@ -139,27 +155,36 @@ class SweepWorker(QThread):
             source_values: list[float],
             current_values: list[float],
             measured_voltage_values: list[float] | None,
+            secondary_current_values: list[float],
+            secondary_voltage_values: list[float] | None,
         ) -> int:
             primary_points = build_primary_values(
                 source_values,
                 current_values,
                 measured_voltage_values,
             )
-            try:
-                secondary_chunk_values = measure_secondary_chunk()
-            except Exception:
-                secondary_chunk_values = {}
-            for source_value, primary_values in zip(source_values, primary_points):
+            secondary_points = build_secondary_values(
+                secondary_current_values,
+                secondary_voltage_values,
+                stepper_setpoint,
+            )
+            emitted_points = 0
+            for source_value, primary_values, secondary_values in zip(
+                source_values,
+                primary_points,
+                secondary_points,
+            ):
                 payload = build_payload(
                     started_at,
                     series_name,
                     float(source_value),
                     float(stepper_setpoint),
                     primary_values,
-                    dict(secondary_chunk_values),
+                    secondary_values,
                 )
                 self.data_ready.emit(payload)
-            return min(len(source_values), len(primary_points))
+                emitted_points += 1
+            return emitted_points
 
         def stream_iv_pass(
             started_at: float,
@@ -172,7 +197,13 @@ class SweepWorker(QThread):
             use_ramp_down: bool,
         ) -> int:
             emitted_points = 0
-            for source_chunk, current_chunk, measured_v_chunk in self.instrument.run_iv_sweep(
+            for (
+                source_chunk,
+                current_chunk,
+                measured_v_chunk,
+                secondary_i_chunk,
+                secondary_v_chunk,
+            ) in self.instrument.run_iv_sweep(
                 primary_channel,
                 sweep_start,
                 sweep_stop,
@@ -195,6 +226,8 @@ class SweepWorker(QThread):
                     list(source_chunk),
                     list(current_chunk),
                     None if measured_v_chunk is None else list(measured_v_chunk),
+                    list(secondary_i_chunk),
+                    None if secondary_v_chunk is None else list(secondary_v_chunk),
                 )
             return emitted_points
 
