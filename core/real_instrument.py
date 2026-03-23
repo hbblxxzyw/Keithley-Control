@@ -30,7 +30,7 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_TIMEOUT_MS = 10000
     DEFAULT_POLL_INTERVAL_S = 0.1
     MIN_CHUNK_POINTS = 5
-    MEASURE_EVERY_N_POINTS = 3
+    MEASURE_EVERY_N_POINTS = 1
     DEFAULT_RESOURCE_ENCODING = "latin-1"
 
     def __init__(self, debug: bool = False) -> None:
@@ -393,6 +393,59 @@ class RealKeithley2636(AbstractSMU):
             step_v = (v_stop - v_start) / (total_points - 1)
             return [v_start + (idx - 1) * step_v for idx in range(start_point, end_point + 1)]
 
+        def _measure_ramp_point() -> tuple[float, float | None]:
+            if self.debug:
+                voltage = float(self._source_levels.get(smu_channel, 0.0))
+                current = 1.23e-6 + voltage * 1e-7
+                return current, voltage if capture_voltage else None
+
+            if capture_voltage:
+                reply = self._query_cmd(
+                    f"print({smu_channel}.measure.v(), {smu_channel}.measure.i())"
+                )
+                parts = [part for part in re.split(r"[\t,\r\n ]+", reply.strip()) if part]
+                measured_voltage = float(parts[0]) if len(parts) > 0 else float(
+                    self._source_levels.get(smu_channel, 0.0)
+                )
+                current = float(parts[1]) if len(parts) > 1 else 0.0
+                return current, measured_voltage
+
+            current = float(self._query_cmd(f"print({smu_channel}.measure.i())"))
+            return current, None
+
+        def _execute_software_ramp(
+            v_start: float,
+            v_stop: float,
+            max_step: float,
+            step_delay: float,
+        ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
+            if abs(v_stop - v_start) <= 0:
+                return
+
+            ramp_pts = max(
+                2,
+                int(math.ceil(abs(v_stop - v_start) / max(max_step, 1e-9))) + 1,
+            )
+            ramp_values = np.linspace(v_start, v_stop, ramp_pts).tolist()
+            source_chunk: list[float] = []
+            current_chunk: list[float] = []
+            measured_voltage_chunk: list[float] | None = [] if capture_voltage else None
+
+            for voltage in ramp_values:
+                self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
+                self._source_levels[smu_channel] = float(voltage)
+                if step_delay > 0:
+                    time.sleep(step_delay)
+                current, measured_voltage = _measure_ramp_point()
+                source_chunk.append(float(voltage))
+                current_chunk.append(float(current))
+                if measured_voltage_chunk is not None:
+                    measured_voltage_chunk.append(
+                        float(voltage) if measured_voltage is None else float(measured_voltage)
+                    )
+
+            yield source_chunk, current_chunk, measured_voltage_chunk
+
         def _configure_fast_measurement(limit_amps: float | None) -> None:
             self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
             self._send_cmd(
@@ -431,7 +484,9 @@ class RealKeithley2636(AbstractSMU):
         # 4) Poll and yield incremental chunks (no fixed sleep)
         old_n = 0
 
-        # 5) Execute trigger blocks for ramp up, main sweep, and ramp down.
+        # 5) Execute the main trigger block. Ramp-up/down are handled outside
+        # the trigger model to avoid source jumps and overlapped-operation
+        # errors when transitioning between separate trigger blocks.
         def _execute_trigger_block(v_start: float, v_stop: float, block_pts: int, block_delay: float):
             """Execute a single continuous trigger block (for ramp up, main sweep, and ramp down) and stream data"""
             nonlocal old_n
@@ -448,8 +503,6 @@ class RealKeithley2636(AbstractSMU):
                 old_n += block_pts
                 return
 
-            # Prime the static source level with the first point so the block
-            # starts from the expected voltage when the trigger model begins.
             self._send_cmd(f"{smu_channel}.source.levelv = {v_start}")
             self._source_levels[smu_channel] = float(v_start)
             # Set specific step delay (e.g. ru_delay, delay, rd_delay)
@@ -471,12 +524,6 @@ class RealKeithley2636(AbstractSMU):
             
             # Start hardware scan
             self._send_cmd(f"{smu_channel}.trigger.initiate()")
-            # When the trigger block completes, the SMU falls back to the
-            # static source level. Preload the block's terminal value here so
-            # ramp-up ends holding at start_v of the main sweep instead of
-            # snapping back to 0 V.
-            self._send_cmd(f"{smu_channel}.source.levelv = {v_stop}")
-            self._source_levels[smu_channel] = float(v_stop)
 
             # poll and pull incremental data for this block
             block_base_n = old_n
@@ -535,14 +582,11 @@ class RealKeithley2636(AbstractSMU):
 
         # Step A：Ramp Up
         if ramp_up and abs(start_v) > 0:
-            # Calculate safe points based on ru_step (round up to ensure actual step <= ru_step)
-            ru_pts = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
-            yield from _execute_trigger_block(0.0, start_v, ru_pts, ru_delay)
+            yield from _execute_software_ramp(0.0, start_v, ru_step, ru_delay)
 
         # Step B：Main Sweep
         yield from _execute_trigger_block(start_v, stop_v, points, delay)
 
         # Step C：Ramp Down
         if ramp_down and abs(stop_v) > 0:
-            rd_pts = max(2, int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1)
-            yield from _execute_trigger_block(stop_v, 0.0, rd_pts, rd_delay)
+            yield from _execute_software_ramp(stop_v, 0.0, rd_step, rd_delay)

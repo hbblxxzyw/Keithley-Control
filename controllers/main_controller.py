@@ -100,7 +100,7 @@ class SweepWorker(QThread):
         def secondary_channel_name() -> str:
             return "smub" if primary_channel == "smua" else "smua"
 
-        def measure_secondary_chunk() -> dict[str, float]:
+        def measure_secondary_point() -> dict[str, float]:
             secondary_channel = secondary_channel_name()
             return self.instrument.measure_selected(
                 secondary_channel,
@@ -145,18 +145,18 @@ class SweepWorker(QThread):
                 current_values,
                 measured_voltage_values,
             )
-            try:
-                secondary_chunk_values = measure_secondary_chunk()
-            except Exception:
-                secondary_chunk_values = {}
             for source_value, primary_values in zip(source_values, primary_points):
+                try:
+                    secondary_point_values = measure_secondary_point()
+                except Exception:
+                    secondary_point_values = {}
                 payload = build_payload(
                     started_at,
                     series_name,
                     float(source_value),
                     float(stepper_setpoint),
                     primary_values,
-                    dict(secondary_chunk_values),
+                    dict(secondary_point_values),
                 )
                 self.data_ready.emit(payload)
             return min(len(source_values), len(primary_points))
