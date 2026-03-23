@@ -380,14 +380,7 @@ class RealKeithley2636(AbstractSMU):
         capture_voltage = bool({"Voltage", "Resistance"} & requested_measurements)
 
         def _parse_buffer(reply: str) -> list[float]:
-            parts = [p.strip() for p in reply.split(",") if p.strip()]
-            out: list[float] = []
-            for p in parts:
-                try:
-                    out.append(float(p))
-                except ValueError:
-                    continue
-            return out
+            return self._extract_float_values(reply)
 
         def _linear_chunk_values(
             v_start: float,
@@ -540,9 +533,11 @@ class RealKeithley2636(AbstractSMU):
             target_n = old_n + block_pts
             while old_n < target_n:
                 time.sleep(self.DEFAULT_POLL_INTERVAL_S)
-                current_n = int(
-                    float(self._query_cmd(f"print({smu_channel}.nvbuffer1.n)"))
-                )
+                count_reply = self._query_cmd(f"print({smu_channel}.nvbuffer1.n)")
+                count_values = self._extract_float_values(count_reply)
+                if not count_values:
+                    continue
+                current_n = int(count_values[0])
                 if current_n <= old_n:
                     continue
                 if (
