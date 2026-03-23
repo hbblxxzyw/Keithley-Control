@@ -133,13 +133,20 @@ class AbstractSMU(ABC):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
+        secondary_mode: str = "fixed",
+        secondary_level: float = 0.0,
+        secondary_start_v: float | None = None,
+        secondary_stop_v: float | None = None,
+        secondary_current_limit: float | None = None,
     ) -> Generator[
         tuple[
             list[float],
             list[float],
             list[float] | None,
             list[float],
+            list[float],
             list[float] | None,
+            list[float],
         ],
         None,
         None,
@@ -169,10 +176,29 @@ class AbstractSMU(ABC):
             ramp_down: If True, ramp from stop_v to 0 V after the sweep.
             rd_step: Ramp-down voltage step in V.
             rd_delay: Ramp-down step delay in s.
+            secondary_mode: Secondary channel sweep mode for the block.
+                "fixed" produces a constant source list; "linear" produces a
+                linearly spaced synchronized sweep.
+            secondary_level: Secondary constant-bias level in V when
+                secondary_mode == "fixed".
+            secondary_start_v: Optional secondary sweep start in V when
+                secondary_mode == "linear".
+            secondary_stop_v: Optional secondary sweep stop in V when
+                secondary_mode == "linear".
+            secondary_current_limit: Optional current compliance/range hint in
+                A for the secondary channel during the synchronized block.
 
         Yields:
             Tuples
-            (source_voltages, primary_currents, primary_measured_voltages,
-            secondary_currents, secondary_measured_voltages) for each chunk.
+            (
+                primary_source_voltages,
+                primary_currents,
+                primary_measured_voltages,
+                secondary_source_voltages,
+                secondary_currents,
+                secondary_measured_voltages,
+                primary_timestamps,
+            )
+            for each chunk.
         """
         pass

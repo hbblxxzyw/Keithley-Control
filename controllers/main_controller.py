@@ -70,13 +70,15 @@ class SweepWorker(QThread):
         delay_s = max(0.0, src_meas_delay)
         step_sweep_delay_s = max(0.0, step_sweep_delay)
 
-        def build_primary_values(
+        secondary_channel = "smub" if primary_channel == "smua" else "smua"
+
+        def build_channel_values(
+            requested_items: list[str],
             source_values: list[float],
             current_values: list[float],
             measured_voltage_values: list[float] | None,
         ) -> list[dict[str, float]]:
             values_per_point: list[dict[str, float]] = []
-            requested_items = list(measure_cfg[primary_channel]["items"])
             for index, (source_voltage, current) in enumerate(zip(source_values, current_values)):
                 measured_voltage = None
                 if measured_voltage_values is not None and index < len(measured_voltage_values):
@@ -95,92 +97,73 @@ class SweepWorker(QThread):
                 values_per_point.append(point_values)
             return values_per_point
 
-        def build_secondary_values(
-            current_values: list[float],
-            measured_voltage_values: list[float] | None,
-            stepper_setpoint: float,
-        ) -> list[dict[str, float]]:
-            values_per_point: list[dict[str, float]] = []
-            secondary_channel = "smub" if primary_channel == "smua" else "smua"
-            requested_items = list(measure_cfg[secondary_channel]["items"])
-            for index, current in enumerate(current_values):
-                measured_voltage = None
-                if measured_voltage_values is not None and index < len(measured_voltage_values):
-                    measured_voltage = float(measured_voltage_values[index])
-                point_voltage = (
-                    measured_voltage
-                    if measured_voltage is not None
-                    else float(stepper_setpoint)
-                )
-                point_values: dict[str, float] = {"Voltage": point_voltage}
-                if "Current" in requested_items:
-                    point_values["Current"] = float(current)
-                if "Resistance" in requested_items:
-                    if abs(current) > 1e-15:
-                        point_values["Resistance"] = point_voltage / float(current)
-                    else:
-                        point_values["Resistance"] = float("inf")
-                values_per_point.append(point_values)
-            return values_per_point
-
         def build_payload(
             started_at: float,
             series_name: str,
             primary_setpoint: float,
-            stepper_setpoint: float,
+            secondary_setpoint: float,
             primary_values: dict[str, float],
             secondary_values: dict[str, float],
+            sample_timestamp: float | None = None,
         ) -> dict[str, object]:
             smu1_values = primary_values if primary_channel == "smua" else secondary_values
             smu2_values = primary_values if primary_channel == "smub" else secondary_values
-            return {
+            payload: dict[str, object] = {
                 "time_s": time.monotonic() - started_at,
                 "series_name": series_name,
                 "primary_name": primary_name,
                 "stepper_name": stepper_name,
                 "smu1": {
-                    "source_v": primary_setpoint if primary_channel == "smua" else stepper_setpoint,
+                    "source_v": primary_setpoint if primary_channel == "smua" else secondary_setpoint,
                     "values": smu1_values,
                 },
                 "smu2": {
-                    "source_v": primary_setpoint if primary_channel == "smub" else stepper_setpoint,
+                    "source_v": primary_setpoint if primary_channel == "smub" else secondary_setpoint,
                     "values": smu2_values,
                 },
             }
+            if sample_timestamp is not None:
+                payload["sample_t_s"] = sample_timestamp
+            return payload
 
         def emit_chunk_payloads(
             started_at: float,
             series_name: str,
-            stepper_setpoint: float,
-            source_values: list[float],
-            current_values: list[float],
-            measured_voltage_values: list[float] | None,
+            primary_source_values: list[float],
+            primary_current_values: list[float],
+            primary_voltage_values: list[float] | None,
+            secondary_source_values: list[float],
             secondary_current_values: list[float],
             secondary_voltage_values: list[float] | None,
+            timestamp_values: list[float],
         ) -> int:
-            primary_points = build_primary_values(
-                source_values,
-                current_values,
-                measured_voltage_values,
+            primary_points = build_channel_values(
+                list(measure_cfg[primary_channel]["items"]),
+                primary_source_values,
+                primary_current_values,
+                primary_voltage_values,
             )
-            secondary_points = build_secondary_values(
+            secondary_points = build_channel_values(
+                list(measure_cfg[secondary_channel]["items"]),
+                secondary_source_values,
                 secondary_current_values,
                 secondary_voltage_values,
-                stepper_setpoint,
             )
             emitted_points = 0
-            for source_value, primary_values, secondary_values in zip(
-                source_values,
+            for index, (primary_source_value, secondary_source_value, primary_values, secondary_values) in enumerate(zip(
+                primary_source_values,
+                secondary_source_values,
                 primary_points,
                 secondary_points,
-            ):
+            )):
                 payload = build_payload(
                     started_at,
                     series_name,
-                    float(source_value),
-                    float(stepper_setpoint),
+                    float(primary_source_value),
+                    float(secondary_source_value),
                     primary_values,
                     secondary_values,
+                    float(timestamp_values[index]) if index < len(timestamp_values) else None,
                 )
                 self.data_ready.emit(payload)
                 emitted_points += 1
@@ -198,11 +181,13 @@ class SweepWorker(QThread):
         ) -> int:
             emitted_points = 0
             for (
-                source_chunk,
-                current_chunk,
-                measured_v_chunk,
-                secondary_i_chunk,
-                secondary_v_chunk,
+                primary_source_chunk,
+                primary_current_chunk,
+                primary_voltage_chunk,
+                secondary_source_chunk,
+                secondary_current_chunk,
+                secondary_voltage_chunk,
+                timestamp_chunk,
             ) in self.instrument.run_iv_sweep(
                 primary_channel,
                 sweep_start,
@@ -218,16 +203,22 @@ class SweepWorker(QThread):
                 use_ramp_down,
                 rd_step,
                 rd_delay,
+                "fixed",
+                stepper_setpoint,
+                None,
+                None,
+                stepper_limit,
             ):
                 emitted_points += emit_chunk_payloads(
                     started_at,
                     series_name,
-                    stepper_setpoint,
-                    list(source_chunk),
-                    list(current_chunk),
-                    None if measured_v_chunk is None else list(measured_v_chunk),
-                    list(secondary_i_chunk),
-                    None if secondary_v_chunk is None else list(secondary_v_chunk),
+                    list(primary_source_chunk),
+                    list(primary_current_chunk),
+                    None if primary_voltage_chunk is None else list(primary_voltage_chunk),
+                    list(secondary_source_chunk),
+                    list(secondary_current_chunk),
+                    None if secondary_voltage_chunk is None else list(secondary_voltage_chunk),
+                    list(timestamp_chunk),
                 )
             return emitted_points
 

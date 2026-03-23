@@ -86,13 +86,20 @@ class DummyKeithley2636(AbstractSMU):
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
+        secondary_mode: str = "fixed",
+        secondary_level: float = 0.0,
+        secondary_start_v: float | None = None,
+        secondary_stop_v: float | None = None,
+        secondary_current_limit: float | None = None,
     ) -> Generator[
         tuple[
             list[float],
             list[float],
             list[float] | None,
             list[float],
+            list[float],
             list[float] | None,
+            list[float],
         ],
         None,
         None,
@@ -104,13 +111,25 @@ class DummyKeithley2636(AbstractSMU):
         step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
         voltages = [start_v + i * step for i in range(points)]
         currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
-        secondary_voltage = float(self._source_levels.get(secondary_channel, 0.0))
+        if str(secondary_mode).strip().lower() == "linear":
+            sec_start = secondary_start_v if secondary_start_v is not None else secondary_level
+            sec_stop = secondary_stop_v if secondary_stop_v is not None else secondary_level
+            sec_step = (sec_stop - sec_start) / (points - 1) if points > 1 else 0.0
+            secondary_source_values = [sec_start + i * sec_step for i in range(points)]
+        else:
+            secondary_source_values = [float(secondary_level)] * points
+        secondary_voltage = float(
+            secondary_source_values[-1]
+            if secondary_source_values
+            else self._source_levels.get(secondary_channel, 0.0)
+        )
         secondary_currents = [
-            8.9e-7 + secondary_voltage * 8e-8 + index * 1e-9
-            for index in range(points)
+            8.9e-7 + secondary_source * 8e-8 + index * 1e-9
+            for index, secondary_source in enumerate(secondary_source_values)
         ]
         measured_voltages = None
         secondary_measured_voltages = None
+        timestamps = [float(index) * max(delay, 0.0) for index in range(points)]
         if measurement_items and any(
             item in {"Voltage", "Resistance"} for item in measurement_items
         ):
@@ -119,6 +138,10 @@ class DummyKeithley2636(AbstractSMU):
             voltages,
             currents,
             measured_voltages,
+            secondary_source_values,
             secondary_currents,
             secondary_measured_voltages,
+            timestamps,
         )
+        self._source_levels[smu_channel] = float(voltages[-1])
+        self._source_levels[secondary_channel] = float(secondary_voltage)
