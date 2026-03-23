@@ -6,7 +6,7 @@ Graph and Table tabs for measurement data.
 """
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QValidator
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -162,6 +162,39 @@ class MeasurePopupButton(QWidget):
         )
 
 
+class ScientificDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that accepts scientific notation and displays tiny values as 1E-7."""
+
+    scientific_threshold = 1e-5
+
+    def textFromValue(self, value: float) -> str:
+        abs_value = abs(float(value))
+        if abs_value != 0.0 and abs_value < self.scientific_threshold:
+            return f"{value:.0E}"
+        decimals = max(0, min(self.decimals(), 9))
+        text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    def valueFromText(self, text: str) -> float:
+        cleaned = text.replace(self.suffix(), "").strip()
+        if not cleaned:
+            return self.minimum()
+        return float(cleaned)
+
+    def validate(self, text: str, pos: int) -> tuple[QValidator.State, str, int]:
+        cleaned = text.replace(self.suffix(), "").strip()
+        if not cleaned or cleaned in {"-", "+", ".", "-.", "+.", "E", "e"}:
+            return (QValidator.State.Intermediate, text, pos)
+        try:
+            float(cleaned)
+        except ValueError:
+            partial_markers = ("e", "e+", "e-", "E", "E+", "E-")
+            if cleaned.endswith(partial_markers):
+                return (QValidator.State.Intermediate, text, pos)
+            return (QValidator.State.Invalid, text, pos)
+        return (QValidator.State.Acceptable, text, pos)
+
+
 class MainWindowUI(QMainWindow):
     """
     Main application window with a top-level QTabWidget:
@@ -170,10 +203,60 @@ class MainWindowUI(QMainWindow):
 
     # Emitted when any Channel Settings form widget (SMU 1 or SMU 2) changes
     channel_config_changed = Signal()
+    CURRENT_LIMIT_RULES = {
+        "260X": (100e-9, 3.03),
+        "261X": (100e-9, 1.515),
+        "263X": (1e-9, 1.515),
+    }
+    VOLTAGE_LIMIT_RULES = {
+        "260X": (1e-3, 40.4),
+        "261X": (1e-3, 202.0),
+        "263X": (1e-3, 202.0),
+    }
 
     def emit_config_changed(self, *args: object) -> None:
         """统一的槽函数，用于转发所有表单变动"""
         self.channel_config_changed.emit()
+
+    def set_instrument_model(self, model_name: str | None) -> None:
+        """Update limit ranges to match the connected 2600B-series model."""
+        normalized = str(model_name or "").strip().upper()
+        self.instrument_model = normalized or "2636B"
+        self._refresh_dynamic_ui_state()
+
+    def _instrument_model_family(self) -> str:
+        model = str(getattr(self, "instrument_model", "2636B") or "").upper()
+        if model.startswith(("2601B", "2602B", "2604B")):
+            return "260X"
+        if model.startswith(("2611B", "2612B", "2614B")):
+            return "261X"
+        if model.startswith(("2634B", "2635B", "2636B")):
+            return "263X"
+        return "263X"
+
+    def _apply_limit_spin_config(self, smu_index: int) -> None:
+        function_text = str(
+            getattr(self, f"function_combo_smu{smu_index}").currentText() or ""
+        ).strip()
+        limit_spin = getattr(self, f"limit_spin_smu{smu_index}")
+        model_family = self._instrument_model_family()
+
+        if function_text == "Voltage":
+            min_limit, max_limit = self.CURRENT_LIMIT_RULES[model_family]
+            suffix = " A"
+            step = 1e-3
+        else:
+            min_limit, max_limit = self.VOLTAGE_LIMIT_RULES[model_family]
+            suffix = " V"
+            step = 0.1
+
+        limit_spin.blockSignals(True)
+        limit_spin.setDecimals(9)
+        limit_spin.setSingleStep(step)
+        limit_spin.setRange(min_limit, max_limit)
+        limit_spin.setSuffix(suffix)
+        limit_spin.setValue(min(max(limit_spin.value(), min_limit), max_limit))
+        limit_spin.blockSignals(False)
 
     def _mode_text(self, smu_index: int) -> str:
         combo = getattr(self, f"mode_combo_smu{smu_index}", None)
@@ -188,6 +271,21 @@ class MainWindowUI(QMainWindow):
         dual_check = getattr(self, f"dual_sweep_check_smu{smu_index}")
         dual_check.setEnabled(is_sweep)
         dual_check.setVisible(is_sweep)
+
+    def _apply_ramp_visibility(self, smu_index: int) -> None:
+        function_text = str(
+            getattr(self, f"function_combo_smu{smu_index}").currentText() or ""
+        ).strip()
+        is_voltage_sweep = function_text == "Voltage" and self._mode_text(smu_index) == "sweep"
+        getattr(self, f"ramp_container_smu{smu_index}").setVisible(is_voltage_sweep)
+        getattr(self, f"ramp_up_row_smu{smu_index}").setVisible(
+            is_voltage_sweep
+            and bool(getattr(self, f"ramp_up_check_smu{smu_index}").isChecked())
+        )
+        getattr(self, f"ramp_down_row_smu{smu_index}").setVisible(
+            is_voltage_sweep
+            and bool(getattr(self, f"ramp_down_check_smu{smu_index}").isChecked())
+        )
 
     def _apply_common_settings_state(self) -> None:
         mode1 = self._mode_text(1)
@@ -218,7 +316,11 @@ class MainWindowUI(QMainWindow):
     def _refresh_dynamic_ui_state(self) -> None:
         self._apply_channel_mode_state(1)
         self._apply_channel_mode_state(2)
+        self._apply_ramp_visibility(1)
+        self._apply_ramp_visibility(2)
         self._apply_common_settings_state()
+        self._apply_limit_spin_config(1)
+        self._apply_limit_spin_config(2)
 
     def _config_widgets(self) -> list[QWidget]:
         widgets: list[QWidget] = [
@@ -420,6 +522,7 @@ class MainWindowUI(QMainWindow):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.instrument_model = "2636B"
         self.setWindowTitle("Keithley 2636 SMU Control")
         self.setMinimumSize(1000, 700)
         self.resize(1200, 800)
@@ -702,22 +805,6 @@ class MainWindowUI(QMainWindow):
         ramp_down_hbox.addWidget(ramp_down_delay)
         ramp_container_layout.addWidget(ramp_down_row)
 
-        def update_ramp_visibility() -> None:
-            is_voltage_sweep = (
-                function_combo.currentText() == "Voltage"
-                and mode_combo.currentText() == "Sweep"
-            )
-            ramp_container.setVisible(is_voltage_sweep)
-            if is_voltage_sweep:
-                ramp_up_row.setVisible(ramp_up_check.isChecked())
-                ramp_down_row.setVisible(ramp_down_check.isChecked())
-
-        function_combo.currentTextChanged.connect(update_ramp_visibility)
-        mode_combo.currentTextChanged.connect(update_ramp_visibility)
-        ramp_up_check.stateChanged.connect(update_ramp_visibility)
-        ramp_down_check.stateChanged.connect(update_ramp_visibility)
-        update_ramp_visibility()
-
         form.addRow("Ramp:", ramp_container)
 
         level_spin = QDoubleSpinBox()
@@ -739,10 +826,10 @@ class MainWindowUI(QMainWindow):
         step_display.setStyleSheet("color: white; padding: 2px;")
         form.addRow("Step:", step_display)
 
-        limit_spin = QDoubleSpinBox()
-        limit_spin.setRange(1e-9, 10.0)
-        limit_spin.setDecimals(4)
-        limit_spin.setSingleStep(0.01)
+        limit_spin = ScientificDoubleSpinBox()
+        limit_spin.setRange(1e-9, 1.515)
+        limit_spin.setDecimals(9)
+        limit_spin.setSingleStep(1e-3)
         limit_spin.setSuffix(" A")
         form.addRow("Limit:", limit_spin)
 
@@ -807,9 +894,16 @@ class MainWindowUI(QMainWindow):
         self.clear_plot_btn = QPushButton("Clear Plot")
         self.autoscale_btn = QPushButton("Autoscale")
         self.export_image_btn = QPushButton("Export to Image")
+        self.graph_linear_btn = QPushButton("Linear")
+        self.graph_log_btn = QPushButton("Log |I|")
+        self.graph_linear_btn.setCheckable(True)
+        self.graph_log_btn.setCheckable(True)
+        self.graph_linear_btn.setChecked(True)
         graph_toolbar.addWidget(self.clear_plot_btn)
         graph_toolbar.addWidget(self.autoscale_btn)
         graph_toolbar.addWidget(self.export_image_btn)
+        graph_toolbar.addWidget(self.graph_linear_btn)
+        graph_toolbar.addWidget(self.graph_log_btn)
         graph_toolbar.addStretch()
         layout.addLayout(graph_toolbar)
 

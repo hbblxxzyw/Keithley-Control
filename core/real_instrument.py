@@ -47,6 +47,7 @@ class RealKeithley2636(AbstractSMU):
         self._source_limits: dict[str, float | None] = {"smua": None, "smub": None}
         self._source_modes: dict[str, str] = {}
         self._measure_state: dict[str, dict[str, object]] = {}
+        self._instrument_model = "2636B" if debug else None
 
     def _send_cmd(self, cmd: str) -> None:
         """
@@ -132,6 +133,28 @@ class RealKeithley2636(AbstractSMU):
         if self._resource is not None:
             self._resource.close()
             self._resource = None
+        self._instrument_model = None
+
+    def get_model(self) -> str | None:
+        """Return the detected instrument model when available."""
+        if self.debug:
+            return self._instrument_model or "2636B"
+        if self._resource is None:
+            return self._instrument_model
+        if self._instrument_model:
+            return self._instrument_model
+
+        for query in ("print(localnode.model)", "*IDN?"):
+            try:
+                reply = self._query_cmd(query)
+            except Exception:
+                continue
+            match = re.search(r"\b(260[124]B|261[124]B|263[456]B)\b", reply.upper())
+            if match:
+                self._instrument_model = match.group(1)
+                return self._instrument_model
+
+        return None
 
     def find_resource_address(self, preferred_serial: str | None = None) -> str | None:
         """Return the most likely VISA resource address for the target instrument."""
@@ -322,13 +345,14 @@ class RealKeithley2636(AbstractSMU):
         delay: float = 0.0,
         nplc: float = 1.0,
         current_limit: float | None = None,
+        measurement_items: list[str] | None = None,
         ramp_up: bool = False,
         ru_step: float = 0.5,
         ru_delay: float = 0.1,
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> Generator[tuple[list[float], list[float]], None, None]:
+    ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
         """
         Run a linear voltage sweep using the instrument's Trigger Model.
 
@@ -344,6 +368,8 @@ class RealKeithley2636(AbstractSMU):
         sweep_current_limit = current_limit
         if sweep_current_limit is None:
             sweep_current_limit = self._current_limits.get(smu_channel)
+        requested_measurements = set(measurement_items or [])
+        capture_voltage = bool({"Voltage", "Resistance"} & requested_measurements)
 
         def _parse_buffer(reply: str) -> list[float]:
             parts = [p.strip() for p in reply.split(",") if p.strip()]
@@ -397,6 +423,9 @@ class RealKeithley2636(AbstractSMU):
         self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
         self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
         self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
+        if capture_voltage:
+            self._send_cmd(f"{smu_channel}.nvbuffer2.clear()")
+            self._send_cmd(f"{smu_channel}.nvbuffer2.appendmode = 1")
         _configure_fast_measurement(sweep_current_limit)
 
         # 4) Poll and yield incremental chunks (no fixed sleep)
@@ -414,16 +443,28 @@ class RealKeithley2636(AbstractSMU):
                 step_v = (v_stop - v_start) / (block_pts - 1) if block_pts > 1 else 0.0
                 v_chunk = [v_start + i * step_v for i in range(block_pts)]
                 i_chunk = [1.23e-6 + (v - v_start) * 1e-7 for v in v_chunk]
-                yield v_chunk, i_chunk
+                measured_v_chunk = list(v_chunk) if capture_voltage else None
+                yield v_chunk, i_chunk, measured_v_chunk
                 old_n += block_pts
                 return
+
+            # Keep the static source level aligned with the next block's first
+            # point so the SMU does not briefly snap back to the previous idle
+            # level (typically 0 V) between consecutive trigger blocks.
+            self._send_cmd(f"{smu_channel}.source.levelv = {v_start}")
+            self._source_levels[smu_channel] = float(v_start)
             # Set specific step delay (e.g. ru_delay, delay, rd_delay)
             self._send_cmd(f"{smu_channel}.source.delay = {block_delay}")
             
             # Configure Trigger Model parameters
             self._send_cmd(f"{smu_channel}.trigger.source.linearv({v_start}, {v_stop}, {block_pts})")
             self._send_cmd(f"{smu_channel}.trigger.source.action = {smu_channel}.ENABLE")
-            self._send_cmd(f"{smu_channel}.trigger.measure.i({smu_channel}.nvbuffer1)")
+            if capture_voltage:
+                self._send_cmd(
+                    f"{smu_channel}.trigger.measure.iv({smu_channel}.nvbuffer1, {smu_channel}.nvbuffer2)"
+                )
+            else:
+                self._send_cmd(f"{smu_channel}.trigger.measure.i({smu_channel}.nvbuffer1)")
             self._send_cmd(f"{smu_channel}.trigger.measure.action = {smu_channel}.ENABLE")
             self._send_cmd(f"{smu_channel}.trigger.count = {block_pts}")
             self._send_cmd(f"{smu_channel}.trigger.source.stimulus = 0")
@@ -453,6 +494,13 @@ class RealKeithley2636(AbstractSMU):
                     f"{smu_channel}.nvbuffer1.readings)"
                 )
                 i_chunk = _parse_buffer(reply_i)
+                measured_v_chunk = None
+                if capture_voltage:
+                    reply_v = self._query_cmd(
+                        f"printbuffer({old_n + 1}, {current_n}, "
+                        f"{smu_channel}.nvbuffer2.readings)"
+                    )
+                    measured_v_chunk = _parse_buffer(reply_v)
                 start_point = old_n - block_base_n + 1
                 end_point = current_n - block_base_n
                 v_chunk = _linear_chunk_values(
@@ -463,8 +511,14 @@ class RealKeithley2636(AbstractSMU):
                     end_point,
                 )
                 n_chunk = min(len(v_chunk), len(i_chunk))
+                if measured_v_chunk is not None:
+                    n_chunk = min(n_chunk, len(measured_v_chunk))
                 if n_chunk > 0:
-                    yield v_chunk[:n_chunk], i_chunk[:n_chunk]
+                    yield (
+                        v_chunk[:n_chunk],
+                        i_chunk[:n_chunk],
+                        None if measured_v_chunk is None else measured_v_chunk[:n_chunk],
+                    )
                 old_n = current_n
 
             # The buffer can reach target_n a few milliseconds before the

@@ -75,18 +75,23 @@ class SweepWorker(QThread):
         def build_primary_values(
             source_values: list[float],
             current_values: list[float],
+            measured_voltage_values: list[float] | None,
         ) -> list[dict[str, float]]:
             values_per_point: list[dict[str, float]] = []
             requested_items = list(measure_cfg[primary_channel]["items"])
-            for voltage, current in zip(source_values, current_values):
-                # Always include the source setpoint so the UI has an X-axis
-                # value even when voltage measurement is not selected.
-                point_values: dict[str, float] = {"Voltage": float(voltage)}
+            for index, (source_voltage, current) in enumerate(zip(source_values, current_values)):
+                measured_voltage = None
+                if measured_voltage_values is not None and index < len(measured_voltage_values):
+                    measured_voltage = float(measured_voltage_values[index])
+                point_voltage = (
+                    measured_voltage if measured_voltage is not None else float(source_voltage)
+                )
+                point_values: dict[str, float] = {"Voltage": point_voltage}
                 if "Current" in requested_items:
                     point_values["Current"] = float(current)
                 if "Resistance" in requested_items:
                     if abs(current) > 1e-15:
-                        point_values["Resistance"] = float(voltage) / float(current)
+                        point_values["Resistance"] = point_voltage / float(current)
                     else:
                         point_values["Resistance"] = float("inf")
                 values_per_point.append(point_values)
@@ -133,8 +138,13 @@ class SweepWorker(QThread):
             stepper_setpoint: float,
             source_values: list[float],
             current_values: list[float],
+            measured_voltage_values: list[float] | None,
         ) -> int:
-            primary_points = build_primary_values(source_values, current_values)
+            primary_points = build_primary_values(
+                source_values,
+                current_values,
+                measured_voltage_values,
+            )
             try:
                 secondary_chunk_values = measure_secondary_chunk()
             except Exception:
@@ -162,7 +172,7 @@ class SweepWorker(QThread):
             use_ramp_down: bool,
         ) -> int:
             emitted_points = 0
-            for source_chunk, current_chunk in self.instrument.run_iv_sweep(
+            for source_chunk, current_chunk, measured_v_chunk in self.instrument.run_iv_sweep(
                 primary_channel,
                 sweep_start,
                 sweep_stop,
@@ -170,6 +180,7 @@ class SweepWorker(QThread):
                 delay_s,
                 nplc,
                 primary_limit,
+                list(measure_cfg[primary_channel]["items"]),
                 use_ramp_up,
                 ru_step,
                 ru_delay,
@@ -183,6 +194,7 @@ class SweepWorker(QThread):
                     stepper_setpoint,
                     list(source_chunk),
                     list(current_chunk),
+                    None if measured_v_chunk is None else list(measured_v_chunk),
                 )
             return emitted_points
 
@@ -292,6 +304,12 @@ class MainController:
         self.ui.reset_config_btn.clicked.connect(self.handle_reset_config)
         self.ui.run_btn.clicked.connect(self.handle_run)
         self.ui.clear_plot_btn.clicked.connect(self.handle_clear_plot)
+        self.ui.graph_linear_btn.clicked.connect(
+            lambda: self.handle_graph_scale_change("linear")
+        )
+        self.ui.graph_log_btn.clicked.connect(
+            lambda: self.handle_graph_scale_change("log")
+        )
         self.ui.export_csv_btn.clicked.connect(self.handle_export_csv)
         self.ui.channel_config_changed.connect(self.update_preview_and_summary)
         self.ui.smu_selector.currentIndexChanged.connect(self.update_preview_and_summary)
@@ -300,6 +318,13 @@ class MainController:
         """Clear only the Graph tab plot (keep table data)."""
         self.ui.graph_plot_placeholder.clear_plot()
 
+    def handle_graph_scale_change(self, mode: str) -> None:
+        """Switch the measurement graph between linear and log current display."""
+        normalized = "log" if str(mode).strip().lower() == "log" else "linear"
+        self.ui.graph_linear_btn.setChecked(normalized == "linear")
+        self.ui.graph_log_btn.setChecked(normalized == "log")
+        self.ui.graph_plot_placeholder.set_display_mode(normalized)
+
     def handle_connect(self) -> None:
         """Read address from UI, connect instrument, update status label to Connected (green)."""
         resource_str = self.ui.resource_address_edit.text().strip()
@@ -307,7 +332,16 @@ class MainController:
             return
         ok = self.instrument.connect(resource_str)
         if ok:
-            self.ui.connection_status_label.setText("Connected")
+            model_getter = getattr(self.instrument, "get_model", None)
+            model_name = model_getter() if callable(model_getter) else None
+            set_model = getattr(self.ui, "set_instrument_model", None)
+            if callable(set_model):
+                set_model(model_name)
+
+            status_text = "Connected"
+            if model_name:
+                status_text = f"Connected ({model_name})"
+            self.ui.connection_status_label.setText(status_text)
             self.ui.connection_status_label.setStyleSheet(
                 "color: #2d7d2d; font-weight: bold;"
             )

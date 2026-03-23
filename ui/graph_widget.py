@@ -156,6 +156,7 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self._series: dict[tuple[str, str], PlotDataItem] = {}
         self._data: dict[tuple[str, str], tuple[list[float], list[float]]] = {}
         self._color_index: dict[str, int] = {"SMU 1": 0, "SMU 2": 0}
+        self._display_mode = "linear"
         self._palette = {
             "SMU 1": ["#1565c0", "#00838f", "#3949ab", "#0277bd"],
             "SMU 2": ["#c62828", "#ef6c00", "#ad1457", "#6d4c41"],
@@ -181,6 +182,27 @@ class MeasurementGraphWidget(pg.PlotWidget):
         xs, ys = self._data[key]
         xs.append(x_val)
         ys.append(y_val)
+        self._refresh_curve(key)
+
+    def set_display_mode(self, mode: str) -> None:
+        """Switch between linear current display and log absolute-current display."""
+        normalized = str(mode or "linear").strip().lower()
+        self._display_mode = "log" if normalized == "log" else "linear"
+        self.setLogMode(x=False, y=self._display_mode == "log")
+        if self._display_mode == "log":
+            self.setLabel("left", "|Current| (A)")
+        else:
+            self.setLabel("left", "Current (A)")
+        for key in self._series:
+            self._refresh_curve(key)
+
+    def _refresh_curve(self, key: tuple[str, str]) -> None:
+        xs, ys = self._data[key]
+        if self._display_mode == "log":
+            log_ys = [abs(float(y)) for y in ys if abs(float(y)) > 0.0]
+            log_xs = [x for x, y in zip(xs, ys) if abs(float(y)) > 0.0]
+            self._series[key].setData(log_xs, log_ys)
+            return
         self._series[key].setData(xs, ys)
 
     def clear_plot(self) -> None:

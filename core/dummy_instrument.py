@@ -27,6 +27,10 @@ class DummyKeithley2636(AbstractSMU):
         """No-op."""
         pass
 
+    def get_model(self) -> str:
+        """Return the simulated instrument model."""
+        return "2636B"
+
     def set_output(self, smu_channel: str, state: bool) -> None:
         """No-op."""
         pass
@@ -75,17 +79,23 @@ class DummyKeithley2636(AbstractSMU):
         delay: float = 0.0,
         nplc: float = 1.0,
         current_limit: float | None = None,
+        measurement_items: list[str] | None = None,
         ramp_up: bool = False,
         ru_step: float = 0.5,
         ru_delay: float = 0.1,
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> Generator[tuple[list[float], list[float]], None, None]:
+    ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
         """Yield one chunk of linear voltage sweep and fake currents."""
         if points < 1:
             return
         step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
         voltages = [start_v + i * step for i in range(points)]
         currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
-        yield voltages, currents
+        measured_voltages = None
+        if measurement_items and any(
+            item in {"Voltage", "Resistance"} for item in measurement_items
+        ):
+            measured_voltages = list(voltages)
+        yield voltages, currents, measured_voltages

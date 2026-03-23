@@ -126,13 +126,14 @@ class AbstractSMU(ABC):
         delay: float = 0.0,
         nplc: float = 1.0,
         current_limit: float | None = None,
+        measurement_items: list[str] | None = None,
         ramp_up: bool = False,
         ru_step: float = 0.5,
         ru_delay: float = 0.1,
         ramp_down: bool = False,
         rd_step: float = 0.5,
         rd_delay: float = 0.1,
-    ) -> Generator[tuple[list[float], list[float]], None, None]:
+    ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
         """
         Run a linear voltage sweep (IV sweep) on the specified channel.
 
@@ -149,6 +150,9 @@ class AbstractSMU(ABC):
             nplc: Integration time in PLC (power-line cycles) per measurement.
             current_limit: Optional current compliance/range hint in A for
                 configuring a fixed current measurement range during the sweep.
+            measurement_items: Requested quantities for the primary sweep
+                channel. If voltage or resistance is requested, implementations
+                may return measured voltages in addition to currents.
             ramp_up: If True, ramp from 0 V to start_v before the sweep.
             ru_step: Ramp-up voltage step in V.
             ru_delay: Ramp-up step delay in s.
@@ -157,8 +161,10 @@ class AbstractSMU(ABC):
             rd_delay: Ramp-down step delay in s.
 
         Yields:
-            Tuples (voltages, currents) for each chunk:
+            Tuples (source_voltages, currents, measured_voltages) for each chunk:
             - voltages: List of actual source voltages (may include ramp points).
             - currents: List of corresponding currents, same length as voltages.
+            - measured_voltages: Optional list of measured voltages, same length
+              as voltages when available; otherwise None.
         """
         pass
