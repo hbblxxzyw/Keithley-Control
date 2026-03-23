@@ -449,6 +449,39 @@ class RealKeithley2636(AbstractSMU):
 
             yield source_chunk, current_chunk, measured_voltage_chunk
 
+        def _execute_software_sweep(
+            v_start: float,
+            v_stop: float,
+            block_pts: int,
+            step_delay: float,
+        ) -> Generator[tuple[list[float], list[float], list[float] | None], None, None]:
+            if block_pts < 1:
+                return
+
+            sweep_values = (
+                [float(v_start)]
+                if block_pts == 1
+                else np.linspace(v_start, v_stop, block_pts).tolist()
+            )
+            source_chunk: list[float] = []
+            current_chunk: list[float] = []
+            measured_voltage_chunk: list[float] | None = [] if capture_voltage else None
+
+            for voltage in sweep_values:
+                self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
+                self._source_levels[smu_channel] = float(voltage)
+                if step_delay > 0:
+                    time.sleep(step_delay)
+                current, measured_voltage = _measure_ramp_point()
+                source_chunk.append(float(voltage))
+                current_chunk.append(float(current))
+                if measured_voltage_chunk is not None:
+                    measured_voltage_chunk.append(
+                        float(voltage) if measured_voltage is None else float(measured_voltage)
+                    )
+
+            yield source_chunk, current_chunk, measured_voltage_chunk
+
         def _configure_fast_measurement(limit_amps: float | None) -> None:
             self._send_cmd(f"{smu_channel}.measure.nplc = {nplc}")
             self._send_cmd(
@@ -475,13 +508,20 @@ class RealKeithley2636(AbstractSMU):
         # 2) Turn output ON before sweep
         self._send_cmd(f"{smu_channel}.source.output = {smu_channel}.OUTPUT_ON")
 
+        if capture_voltage:
+            if ramp_up and abs(start_v) > 0:
+                yield from _execute_software_ramp(0.0, start_v, ru_step, ru_delay)
+
+            yield from _execute_software_sweep(start_v, stop_v, points, delay)
+
+            if ramp_down and abs(stop_v) > 0:
+                yield from _execute_software_ramp(stop_v, 0.0, rd_step, rd_delay)
+            return
+
         # 3) Buffer: clear, collect source values, append mode; set fast measurement mode
         self._send_cmd(f"{smu_channel}.nvbuffer1.clear()")
         self._send_cmd(f"{smu_channel}.nvbuffer1.collectsourcevalues = 1")
         self._send_cmd(f"{smu_channel}.nvbuffer1.appendmode = 1")
-        if capture_voltage:
-            self._send_cmd(f"{smu_channel}.nvbuffer2.clear()")
-            self._send_cmd(f"{smu_channel}.nvbuffer2.appendmode = 1")
         _configure_fast_measurement(sweep_current_limit)
 
         # 4) Poll and yield incremental chunks (no fixed sleep)
