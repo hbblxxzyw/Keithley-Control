@@ -99,6 +99,11 @@ class RealKeithley2636(AbstractSMU):
             "\x00\r\n "
         )
 
+    def _extract_float_values(self, reply: str) -> list[float]:
+        """Extract numeric values from a reply that may include prompts or tabs."""
+        number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+        return [float(token) for token in re.findall(number_pattern, reply)]
+
     def connect(self, resource_str: str) -> bool:
         """
         Connect to the instrument. In debug mode only prints a virtual
@@ -206,7 +211,10 @@ class RealKeithley2636(AbstractSMU):
     def measure_current(self, smu_channel: str) -> float:
         """Single current measurement on the given channel; TSP uses print to return value."""
         reply = self._query_cmd(f"print({smu_channel}.measure.i())")
-        return float(reply)
+        values = self._extract_float_values(reply)
+        if not values:
+            raise ValueError(f"Could not parse current reading from reply: {reply!r}")
+        return values[0]
 
     def _measurement_range_amps(self, current_range: str) -> float | None:
         range_map = {
@@ -328,7 +336,7 @@ class RealKeithley2636(AbstractSMU):
 
         expr = ", ".join(f"{smu_channel}.measure.{suffix}()" for _, suffix in selected)
         reply = self._query_cmd(f"print({expr})")
-        parts = [part for part in re.split(r"[\t,\r\n ]+", reply.strip()) if part]
+        parts = self._extract_float_values(reply)
 
         out: dict[str, float] = {}
         for (item, _), value in zip(selected, parts):
@@ -403,14 +411,16 @@ class RealKeithley2636(AbstractSMU):
                 reply = self._query_cmd(
                     f"print({smu_channel}.measure.v(), {smu_channel}.measure.i())"
                 )
-                parts = [part for part in re.split(r"[\t,\r\n ]+", reply.strip()) if part]
+                parts = self._extract_float_values(reply)
                 measured_voltage = float(parts[0]) if len(parts) > 0 else float(
                     self._source_levels.get(smu_channel, 0.0)
                 )
                 current = float(parts[1]) if len(parts) > 1 else 0.0
                 return current, measured_voltage
 
-            current = float(self._query_cmd(f"print({smu_channel}.measure.i())"))
+            current_reply = self._query_cmd(f"print({smu_channel}.measure.i())")
+            parts = self._extract_float_values(current_reply)
+            current = float(parts[0]) if parts else 0.0
             return current, None
 
         def _execute_software_ramp(
