@@ -29,6 +29,7 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_TIMEOUT_MS = 10000
     DEFAULT_POLL_INTERVAL_S = 0.02
     MIN_CHUNK_POINTS = 2
+    MAX_POINTS_PER_PRINTBUFFER = 8
     MEASURE_EVERY_N_POINTS = 3
     DEFAULT_RESOURCE_ENCODING = "latin-1"
 
@@ -88,10 +89,38 @@ class RealKeithley2636(AbstractSMU):
     def _ensure_ascii_stream_format(self) -> None:
         if self.debug:
             return
+        # TODO: Evaluate format.data = format.REAL32 to reduce sweep streaming payload.
         self._send_cmd("format.data = format.ASCII")
         self._send_cmd("format.asciiprecision = 12")
         self._send_cmd("localnode.prompts = 0")
         self._send_cmd("localnode.prompts4882 = 0")
+
+    def _clear_error_state(self) -> None:
+        if self.debug:
+            return
+        # FIX: Clear stale SCPI/TSP state before a sweep starts.
+        self._send_cmd("*CLS")
+        self._send_cmd("errorqueue.clear()")
+
+    def _recover_from_sweep_error(self) -> None:
+        if self.debug:
+            return
+        for cmd in ("smua.abort()", "smub.abort()", "*CLS", "errorqueue.clear()"):
+            try:
+                # FIX: Abort both channels and clear queued errors after any sweep failure.
+                self._send_cmd(cmd)
+            except Exception:
+                pass
+
+    def dump_errors(self) -> list[str]:
+        if self.debug:
+            return []
+        # FIX: Expose instrument error queue contents for field debugging.
+        count = int(float(self._query_cmd("print(errorqueue.count)")))
+        errors: list[str] = []
+        for _ in range(max(count, 0)):
+            errors.append(self._query_cmd("print(errorqueue.next())"))
+        return errors
 
     def _ensure_dual_sync_script_loaded(self) -> None:
         if self._dual_sync_script_loaded:
@@ -539,197 +568,143 @@ end
         self._ensure_ascii_stream_format()
         self._ensure_dual_sync_script_loaded()
 
-        primary_channel = smu_channel
-        secondary_channel = "smub" if smu_channel == "smua" else "smua"
-        sweep_current_limit = current_limit
-        if sweep_current_limit is None:
-            sweep_current_limit = self._current_limits.get(primary_channel)
-        if secondary_current_limit is None:
-            secondary_current_limit = self._current_limits.get(secondary_channel)
+        try:
+            self._clear_error_state()
+            primary_channel = smu_channel
+            secondary_channel = "smub" if smu_channel == "smua" else "smua"
+            sweep_current_limit = current_limit
+            if sweep_current_limit is None:
+                sweep_current_limit = self._current_limits.get(primary_channel)
+            if secondary_current_limit is None:
+                secondary_current_limit = self._current_limits.get(secondary_channel)
 
-        requested_measurements = set(measurement_items or [])
-        capture_primary_voltage = bool({"Voltage", "Resistance"} & requested_measurements)
-        secondary_measurements = set(
-            self._measure_state.get(secondary_channel, {}).get("signature", ())
-        )
-        capture_secondary_voltage = bool(
-            {"Voltage", "Resistance"} & secondary_measurements
-        )
-
-        normalized_secondary_mode = str(secondary_mode).strip().lower()
-        if normalized_secondary_mode == "linear":
-            secondary_start = (
-                secondary_start_v if secondary_start_v is not None else secondary_level
+            requested_measurements = set(measurement_items or [])
+            capture_primary_voltage = bool({"Voltage", "Resistance"} & requested_measurements)
+            secondary_measurements = set(
+                self._measure_state.get(secondary_channel, {}).get("signature", ())
             )
-            secondary_stop = (
-                secondary_stop_v if secondary_stop_v is not None else secondary_level
+            capture_secondary_voltage = bool(
+                {"Voltage", "Resistance"} & secondary_measurements
             )
-            secondary_mode_token = 1
-        else:
-            secondary_start = secondary_level
-            secondary_stop = secondary_level
-            secondary_mode_token = 0
 
-        def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
-            self._send_cmd(f"{channel}.measure.nplc = {float(nplc)}")
-            self._send_cmd(f"{channel}.measure.filter.enable = {channel}.FILTER_OFF")
-            self._send_cmd(f"{channel}.measure.autozero = {channel}.AUTOZERO_ONCE")
-            self._send_cmd(f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF")
-            if limit_amps is not None and limit_amps > 0:
-                self._send_cmd(f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF")
-                self._send_cmd(f"{channel}.measure.rangei = {abs(limit_amps)}")
+            normalized_secondary_mode = str(secondary_mode).strip().lower()
+            if normalized_secondary_mode == "linear":
+                secondary_start = (
+                    secondary_start_v if secondary_start_v is not None else secondary_level
+                )
+                secondary_stop = (
+                    secondary_stop_v if secondary_stop_v is not None else secondary_level
+                )
+                secondary_mode_token = 1
             else:
-                self._send_cmd(f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON")
+                secondary_start = secondary_level
+                secondary_stop = secondary_level
+                secondary_mode_token = 0
 
-        def _pull_chunk(start_index: int, end_index: int) -> tuple[
-            list[float],
-            list[float],
-            list[float] | None,
-            list[float],
-            list[float],
-            list[float] | None,
-            list[float],
-        ]:
-            columns = [
-                f"{primary_channel}.nvbuffer1.sourcevalues",
-                f"{primary_channel}.nvbuffer1.readings",
-            ]
-            primary_voltage_index: int | None = None
-            if capture_primary_voltage:
-                primary_voltage_index = len(columns)
-                columns.append(f"{primary_channel}.nvbuffer2.readings")
+            def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
+                self._send_cmd(f"{channel}.measure.nplc = {float(nplc)}")
+                self._send_cmd(f"{channel}.measure.filter.enable = {channel}.FILTER_OFF")
+                self._send_cmd(f"{channel}.measure.autozero = {channel}.AUTOZERO_ONCE")
+                self._send_cmd(f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF")
+                if limit_amps is not None and limit_amps > 0:
+                    self._send_cmd(f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF")
+                    self._send_cmd(f"{channel}.measure.rangei = {abs(limit_amps)}")
+                else:
+                    self._send_cmd(f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON")
 
-            secondary_source_index = len(columns)
-            columns.append(f"{secondary_channel}.nvbuffer1.sourcevalues")
-            secondary_current_index = len(columns)
-            columns.append(f"{secondary_channel}.nvbuffer1.readings")
-
-            secondary_voltage_index: int | None = None
-            if capture_secondary_voltage:
-                secondary_voltage_index = len(columns)
-                columns.append(f"{secondary_channel}.nvbuffer2.readings")
-
-            timestamp_index = len(columns)
-            columns.append(f"{primary_channel}.nvbuffer1.timestamps")
-
-            reply = self._query_cmd(
-                f"printbuffer({start_index}, {end_index}, {', '.join(columns)})"
-            )
-            rows = self._reshape_printbuffer_rows(reply, len(columns))
-
-            primary_source_values = [row[0] for row in rows]
-            primary_currents = [row[1] for row in rows]
-            primary_measured_voltages = (
-                None
-                if primary_voltage_index is None
-                else [row[primary_voltage_index] for row in rows]
-            )
-            secondary_source_values = [row[secondary_source_index] for row in rows]
-            secondary_currents = [row[secondary_current_index] for row in rows]
-            secondary_measured_voltages = (
-                None
-                if secondary_voltage_index is None
-                else [row[secondary_voltage_index] for row in rows]
-            )
-            primary_timestamps = [row[timestamp_index] for row in rows]
-
-            return (
-                primary_source_values,
-                primary_currents,
-                primary_measured_voltages,
-                secondary_source_values,
-                secondary_currents,
-                secondary_measured_voltages,
-                primary_timestamps,
-            )
-
-        def _start_block(
-            block_start: float,
-            block_stop: float,
-            block_points: int,
-            block_delay: float,
-        ) -> None:
-            self._send_cmd(
-                "oai_dualsync.configure_block("
-                f"{primary_channel}, "
-                f"{secondary_channel}, "
-                f"{self._format_tsp_value(block_start)}, "
-                f"{self._format_tsp_value(block_stop)}, "
-                f"{block_points}, "
-                f"{self._format_tsp_value(block_delay)}, "
-                f"{self._format_tsp_value(sweep_current_limit)}, "
-                f"{self._format_tsp_value(secondary_current_limit)}, "
-                f"{secondary_mode_token}, "
-                f"{self._format_tsp_value(secondary_level)}, "
-                f"{self._format_tsp_value(secondary_start)}, "
-                f"{self._format_tsp_value(secondary_stop)}, "
-                f"{1 if capture_primary_voltage else 0}, "
-                f"{1 if capture_secondary_voltage else 0})"
-            )
-
-        def _debug_block_data(
-            block_start: float,
-            block_stop: float,
-            block_points: int,
-            block_delay: float,
-        ) -> tuple[
-            list[float],
-            list[float],
-            list[float] | None,
-            list[float],
-            list[float],
-            list[float] | None,
-            list[float],
-        ]:
-            if block_points <= 1:
-                primary_source_values = [float(block_start)]
-            else:
-                step_v = (block_stop - block_start) / float(block_points - 1)
-                primary_source_values = [
-                    float(block_start) + step_v * index for index in range(block_points)
+            def _build_linear_segment(
+                start_value: float,
+                stop_value: float,
+                total_points: int,
+                start_index: int,
+                end_index: int,
+            ) -> list[float]:
+                if end_index < start_index:
+                    return []
+                if total_points <= 1:
+                    return [float(start_value)] * max(end_index - start_index + 1, 0)
+                step_value = (float(stop_value) - float(start_value)) / float(total_points - 1)
+                return [
+                    float(start_value) + step_value * (point_index - 1)
+                    for point_index in range(start_index, end_index + 1)
                 ]
-            primary_currents = [
-                1.23e-6 + (value - float(block_start)) * 1e-7
-                for value in primary_source_values
-            ]
-            primary_measured_voltages = (
-                list(primary_source_values) if capture_primary_voltage else None
-            )
-            if secondary_mode_token == 1 and block_points > 1:
-                secondary_step = (secondary_stop - secondary_start) / float(block_points - 1)
-                secondary_source_values = [
-                    float(secondary_start) + secondary_step * index
-                    for index in range(block_points)
-                ]
-            else:
-                secondary_source_values = [float(secondary_level)] * block_points
-            secondary_currents = [
-                8.9e-7 + source_value * 8e-8 + index * 1e-9
-                for index, source_value in enumerate(secondary_source_values)
-            ]
-            secondary_measured_voltages = (
-                list(secondary_source_values) if capture_secondary_voltage else None
-            )
-            primary_timestamps = [
-                float(index) * max(float(block_delay), 0.0) for index in range(block_points)
-            ]
-            return (
-                primary_source_values,
-                primary_currents,
-                primary_measured_voltages,
-                secondary_source_values,
-                secondary_currents,
-                secondary_measured_voltages,
-                primary_timestamps,
-            )
 
-        def _run_block(
-            block_start: float,
-            block_stop: float,
-            block_points: int,
-            block_delay: float,
-        ) -> Generator[
-            tuple[
+            def _pull_chunk(start_index: int, end_index: int) -> tuple[
+                list[float],
+                list[float] | None,
+                list[float],
+                list[float] | None,
+            ]:
+                # FIX: Only fetch essential readings during realtime streaming to keep the output queue small.
+                columns = [f"{primary_channel}.nvbuffer1.readings"]
+                primary_voltage_index: int | None = None
+                if capture_primary_voltage:
+                    primary_voltage_index = len(columns)
+                    columns.append(f"{primary_channel}.nvbuffer2.readings")
+
+                secondary_current_index = len(columns)
+                columns.append(f"{secondary_channel}.nvbuffer1.readings")
+
+                secondary_voltage_index: int | None = None
+                if capture_secondary_voltage:
+                    secondary_voltage_index = len(columns)
+                    columns.append(f"{secondary_channel}.nvbuffer2.readings")
+
+                reply = self._query_cmd(
+                    f"printbuffer({start_index}, {end_index}, {', '.join(columns)})"
+                )
+                rows = self._reshape_printbuffer_rows(reply, len(columns))
+
+                primary_currents = [row[0] for row in rows]
+                primary_measured_voltages = (
+                    None
+                    if primary_voltage_index is None
+                    else [row[primary_voltage_index] for row in rows]
+                )
+                secondary_currents = [row[secondary_current_index] for row in rows]
+                secondary_measured_voltages = (
+                    None
+                    if secondary_voltage_index is None
+                    else [row[secondary_voltage_index] for row in rows]
+                )
+
+                return (
+                    primary_currents,
+                    primary_measured_voltages,
+                    secondary_currents,
+                    secondary_measured_voltages,
+                )
+
+            def _start_block(
+                block_start: float,
+                block_stop: float,
+                block_points: int,
+                block_delay: float,
+            ) -> None:
+                self._send_cmd(
+                    "oai_dualsync.configure_block("
+                    f"{primary_channel}, "
+                    f"{secondary_channel}, "
+                    f"{self._format_tsp_value(block_start)}, "
+                    f"{self._format_tsp_value(block_stop)}, "
+                    f"{block_points}, "
+                    f"{self._format_tsp_value(block_delay)}, "
+                    f"{self._format_tsp_value(sweep_current_limit)}, "
+                    f"{self._format_tsp_value(secondary_current_limit)}, "
+                    f"{secondary_mode_token}, "
+                    f"{self._format_tsp_value(secondary_level)}, "
+                    f"{self._format_tsp_value(secondary_start)}, "
+                    f"{self._format_tsp_value(secondary_stop)}, "
+                    f"{1 if capture_primary_voltage else 0}, "
+                    f"{1 if capture_secondary_voltage else 0})"
+                )
+
+            def _debug_block_data(
+                block_start: float,
+                block_stop: float,
+                block_points: int,
+                block_delay: float,
+            ) -> tuple[
                 list[float],
                 list[float],
                 list[float] | None,
@@ -737,58 +712,165 @@ end
                 list[float],
                 list[float] | None,
                 list[float],
-            ],
-            None,
-            None,
-        ]:
-            if block_points < 1:
-                return
+            ]:
+                if block_points <= 1:
+                    primary_source_values = [float(block_start)]
+                else:
+                    step_v = (block_stop - block_start) / float(block_points - 1)
+                    primary_source_values = [
+                        float(block_start) + step_v * index for index in range(block_points)
+                    ]
+                primary_currents = [
+                    1.23e-6 + (value - float(block_start)) * 1e-7
+                    for value in primary_source_values
+                ]
+                primary_measured_voltages = (
+                    list(primary_source_values) if capture_primary_voltage else None
+                )
+                if secondary_mode_token == 1 and block_points > 1:
+                    secondary_step = (secondary_stop - secondary_start) / float(block_points - 1)
+                    secondary_source_values = [
+                        float(secondary_start) + secondary_step * index
+                        for index in range(block_points)
+                    ]
+                else:
+                    secondary_source_values = [float(secondary_level)] * block_points
+                secondary_currents = [
+                    8.9e-7 + source_value * 8e-8 + index * 1e-9
+                    for index, source_value in enumerate(secondary_source_values)
+                ]
+                secondary_measured_voltages = (
+                    list(secondary_source_values) if capture_secondary_voltage else None
+                )
+                primary_timestamps = [
+                    float(index) * max(float(block_delay), 0.0) for index in range(block_points)
+                ]
+                return (
+                    primary_source_values,
+                    primary_currents,
+                    primary_measured_voltages,
+                    secondary_source_values,
+                    secondary_currents,
+                    secondary_measured_voltages,
+                    primary_timestamps,
+                )
 
-            if self.debug:
-                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
-                yield _debug_block_data(block_start, block_stop, block_points, block_delay)
+            def _run_block(
+                block_start: float,
+                block_stop: float,
+                block_points: int,
+                block_delay: float,
+            ) -> Generator[
+                tuple[
+                    list[float],
+                    list[float],
+                    list[float] | None,
+                    list[float],
+                    list[float],
+                    list[float] | None,
+                    list[float],
+                ],
+                None,
+                None,
+            ]:
+                if block_points < 1:
+                    return
+
+                if self.debug:
+                    time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                    yield _debug_block_data(block_start, block_stop, block_points, block_delay)
+                    self._source_levels[primary_channel] = float(block_stop)
+                    self._source_levels[secondary_channel] = float(
+                        secondary_stop if secondary_mode_token == 1 else secondary_level
+                    )
+                    return
+
+                _start_block(block_start, block_stop, block_points, block_delay)
+                block_old_n = 0
+                while block_old_n < block_points:
+                    # TODO: Consider SRQ/status-model driven completion to replace polling.
+                    time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                    current_n = int(float(self._query_cmd(f"print({primary_channel}.nvbuffer1.n)")))
+                    current_n = min(current_n, block_points)
+                    if current_n <= block_old_n:
+                        continue
+                    if (
+                        current_n < block_points
+                        and current_n - block_old_n < self.MIN_CHUNK_POINTS
+                    ):
+                        continue
+
+                    pull_start = block_old_n + 1
+                    while pull_start <= current_n:
+                        # FIX: Cap each printbuffer request so the Keithley output queue cannot overflow.
+                        pull_end = min(
+                            pull_start + self.MAX_POINTS_PER_PRINTBUFFER - 1,
+                            current_n,
+                        )
+                        (
+                            primary_currents,
+                            primary_measured_voltages,
+                            secondary_currents,
+                            secondary_measured_voltages,
+                        ) = _pull_chunk(pull_start, pull_end)
+                        if primary_currents:
+                            actual_pull_end = pull_start + len(primary_currents) - 1
+                            primary_source_values = _build_linear_segment(
+                                block_start,
+                                block_stop,
+                                block_points,
+                                pull_start,
+                                actual_pull_end,
+                            )
+                            if secondary_mode_token == 1:
+                                secondary_source_values = _build_linear_segment(
+                                    secondary_start,
+                                    secondary_stop,
+                                    block_points,
+                                    pull_start,
+                                    actual_pull_end,
+                                )
+                            else:
+                                secondary_source_values = [float(secondary_level)] * len(
+                                    primary_currents
+                                )
+
+                            yield (
+                                primary_source_values,
+                                primary_currents,
+                                primary_measured_voltages,
+                                secondary_source_values,
+                                secondary_currents,
+                                secondary_measured_voltages,
+                                [],  # FIX: Do not stream timestamps in realtime; keep payload minimal.
+                            )
+
+                        pull_start = pull_end + 1
+
+                    block_old_n = current_n
+
+                self._query_cmd("oai_dualsync.wait_done() print(1)")
                 self._source_levels[primary_channel] = float(block_stop)
                 self._source_levels[secondary_channel] = float(
                     secondary_stop if secondary_mode_token == 1 else secondary_level
                 )
-                return
 
-            _start_block(block_start, block_stop, block_points, block_delay)
-            block_old_n = 0
-            while block_old_n < block_points:
-                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
-                current_n = int(float(self._query_cmd(f"print({primary_channel}.nvbuffer1.n)")))
-                current_n = min(current_n, block_points)
-                if current_n <= block_old_n:
-                    continue
-                if (
-                    current_n < block_points
-                    and current_n - block_old_n < self.MIN_CHUNK_POINTS
-                ):
-                    continue
-                chunk = _pull_chunk(block_old_n + 1, current_n)
-                if chunk[0]:
-                    yield chunk
-                block_old_n = current_n
+            _configure_fast_measurement(primary_channel, sweep_current_limit)
+            _configure_fast_measurement(secondary_channel, secondary_current_limit)
 
-            self._query_cmd("oai_dualsync.wait_done() print(1)")
-            self._source_levels[primary_channel] = float(block_stop)
-            self._source_levels[secondary_channel] = float(
-                secondary_stop if secondary_mode_token == 1 else secondary_level
-            )
+            if ramp_up and abs(start_v) > 0:
+                ramp_up_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
+                yield from _run_block(0.0, start_v, ramp_up_points, ru_delay)
 
-        _configure_fast_measurement(primary_channel, sweep_current_limit)
-        _configure_fast_measurement(secondary_channel, secondary_current_limit)
+            yield from _run_block(start_v, stop_v, points, delay)
 
-        if ramp_up and abs(start_v) > 0:
-            ramp_up_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
-            yield from _run_block(0.0, start_v, ramp_up_points, ru_delay)
-
-        yield from _run_block(start_v, stop_v, points, delay)
-
-        if ramp_down and abs(stop_v) > 0:
-            ramp_down_points = max(
-                2,
-                int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1,
-            )
-            yield from _run_block(stop_v, 0.0, ramp_down_points, rd_delay)
+            if ramp_down and abs(stop_v) > 0:
+                ramp_down_points = max(
+                    2,
+                    int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1,
+                )
+                yield from _run_block(stop_v, 0.0, ramp_down_points, rd_delay)
+        except Exception:
+            # FIX: Recover both SMUs and clear queued errors so the next sweep starts cleanly.
+            self._recover_from_sweep_error()
+            raise
