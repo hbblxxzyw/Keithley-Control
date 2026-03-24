@@ -29,9 +29,10 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_TIMEOUT_MS = 10000
     DEFAULT_POLL_INTERVAL_S = 0.02
     MIN_CHUNK_POINTS = 2
-    MAX_POINTS_PER_PRINTBUFFER = 1
-    MEASURE_EVERY_N_POINTS = 1
+    MAX_POINTS_PER_PRINTBUFFER = 32
+    MEASURE_EVERY_N_POINTS = 8
     DEFAULT_RESOURCE_ENCODING = "latin-1"
+    DUAL_SYNC_SCRIPT_NAME = "oai_dualsync"
 
     def __init__(self, debug: bool = False) -> None:
         self.debug = debug
@@ -83,8 +84,53 @@ class RealKeithley2636(AbstractSMU):
             "\x00\r\n "
         )
 
-    def _send_multiline(self, script_text: str) -> None:
-        self._send_cmd(script_text.strip())
+    def _load_tsp_script(self, script_name: str, script_body: str) -> None:
+        # FIX: Use `loadandrunscript` so the named script is compiled and executed immediately.
+        if self.debug:
+            print(f"[DEBUG LOADSCRIPT] {script_name}")
+            print(script_body.strip())
+            return
+        if self._resource is None:
+            raise RuntimeError("Instrument not connected; call connect() first.")
+        # FIX: Clear stale parser/runtime errors before attempting to load a script.
+        self._send_cmd("*CLS")
+        self._send_cmd("errorqueue.clear()")
+        normalized_body = script_body.strip("\r\n")
+        full_script = f"loadandrunscript {script_name}\n{normalized_body}\nendscript"
+        # FIX: Use the underlying VISA resource directly so the entire script block is written once.
+        self._resource.write(full_script)
+        # FIX: Fail fast if the script produced any syntax/runtime error while loading or running.
+        errors = self.dump_errors()
+        if errors:
+            # FIX: Dump numbered script lines so Keithley TSP line numbers can be matched quickly.
+            self._debug_dump_script_lines(script_body)
+            error_lines = "\n".join(
+                f"  {index}. {entry}" for index, entry in enumerate(errors, start=1)
+            )
+            raise RuntimeError(
+                f"Failed to load TSP script '{script_name}'.\nError queue:\n{error_lines}"
+            )
+        # FIX: Verify the script run registered callable global functions.
+        type_reply = self._query_cmd_checked(
+            "print(type(configure_block), type(wait_done))",
+            f"verifying TSP globals for '{script_name}'",
+        )
+        type_tokens = [
+            token.strip().lower()
+            for token in re.split(r"[\s,]+", type_reply)
+            if token
+        ]
+        if len(type_tokens) < 2 or type_tokens[0] != "function" or type_tokens[1] != "function":
+            raise RuntimeError(
+                "Loaded TSP functions are not callable globals. "
+                f"configure_block={type_tokens[0] if type_tokens else '<missing>'}, "
+                f"wait_done={type_tokens[1] if len(type_tokens) > 1 else '<missing>'}"
+            )
+
+    def _debug_dump_script_lines(self, script_body: str) -> None:
+        # FIX: Print numbered TSP script lines to help map Keithley error line numbers.
+        for line_no, line_text in enumerate(script_body.strip("\r\n").splitlines(), start=1):
+            print(f"[TSP {line_no:03d}] {line_text}")
 
     def _error_queue_count(self) -> int:
         if self.debug:
@@ -157,6 +203,132 @@ class RealKeithley2636(AbstractSMU):
             except Exception:
                 pass
 
+    def _build_dual_sync_script(self) -> str:
+        # FIX: Define helper and entrypoint functions as globals to avoid named-script namespace conflicts.
+        return """
+function _pb(x)
+    x.nvbuffer1.clear()
+    x.nvbuffer1.clearcache()
+    x.nvbuffer1.appendmode = 1
+    x.nvbuffer1.collectsourcevalues = 1
+    x.nvbuffer1.collecttimestamps = 1
+
+    x.nvbuffer2.clear()
+    x.nvbuffer2.clearcache()
+    x.nvbuffer2.appendmode = 1
+    x.nvbuffer2.collectsourcevalues = 1
+    x.nvbuffer2.collecttimestamps = 1
+end
+
+function _lin(a, b, n)
+    local vals = {}
+    local dv = 0
+    if n > 1 then
+        dv = (b - a) / (n - 1)
+    end
+    for i = 1, n do
+        vals[i] = a + (i - 1) * dv
+    end
+    return vals
+end
+
+function _const(v, n)
+    local vals = {}
+    for i = 1, n do
+        vals[i] = v
+    end
+    return vals
+end
+
+function configure_block(pn, sn, p0, p1, n, dt, plim, slim, smode, slev, s0, s1, cpv, csv)
+    local p = _G[pn]
+    local s = _G[sn]
+    if p == nil then
+        error("Unknown primary SMU: " .. tostring(pn))
+    end
+    if s == nil then
+        error("Unknown secondary SMU: " .. tostring(sn))
+    end
+
+    local svals
+    if smode == 1 then
+        svals = _lin(s0, s1, n)
+    else
+        svals = _const(slev, n)
+    end
+
+    p.abort()
+    s.abort()
+    trigger.blender[1].reset()
+
+    _pb(p)
+    _pb(s)
+
+    p.source.func = p.OUTPUT_DCVOLTS
+    s.source.func = s.OUTPUT_DCVOLTS
+
+    if plim ~= nil and plim > 0 then
+        p.source.limiti = plim
+    end
+    if slim ~= nil and slim > 0 then
+        s.source.limiti = slim
+    end
+
+    p.source.levelv = p0
+    s.source.levelv = svals[1]
+    p.source.delay = dt
+    s.source.delay = dt
+
+    p.trigger.source.linearv(p0, p1, n)
+    s.trigger.source.listv(svals)
+    p.trigger.source.action = p.ENABLE
+    s.trigger.source.action = s.ENABLE
+
+    if cpv ~= 0 then
+        p.trigger.measure.iv(p.nvbuffer1, p.nvbuffer2)
+    else
+        p.trigger.measure.i(p.nvbuffer1)
+    end
+    if csv ~= 0 then
+        s.trigger.measure.iv(s.nvbuffer1, s.nvbuffer2)
+    else
+        s.trigger.measure.i(s.nvbuffer1)
+    end
+
+    p.trigger.measure.action = p.ENABLE
+    s.trigger.measure.action = s.ENABLE
+    p.trigger.count = n
+    s.trigger.count = n
+    p.trigger.arm.count = 1
+    s.trigger.arm.count = 1
+
+    p.trigger.arm.stimulus = 0
+    s.trigger.arm.stimulus = p.trigger.ARMED_EVENT_ID
+
+    p.trigger.source.stimulus = 0
+    s.trigger.source.stimulus = 0
+
+    trigger.blender[1].orenable = false
+    trigger.blender[1].stimulus[1] = p.trigger.SOURCE_COMPLETE_EVENT_ID
+    trigger.blender[1].stimulus[2] = s.trigger.SOURCE_COMPLETE_EVENT_ID
+    p.trigger.measure.stimulus = trigger.blender[1].EVENT_ID
+    s.trigger.measure.stimulus = trigger.blender[1].EVENT_ID
+
+    p.trigger.endsweep.action = p.SOURCE_HOLD
+    s.trigger.endsweep.action = s.SOURCE_HOLD
+
+    p.source.output = p.OUTPUT_ON
+    s.source.output = s.OUTPUT_ON
+
+    s.trigger.initiate()
+    p.trigger.initiate()
+end
+
+function wait_done()
+    waitcomplete()
+end
+        """
+
     def _ensure_dual_sync_script_loaded(self) -> None:
         if self._dual_sync_script_loaded:
             return
@@ -164,145 +336,10 @@ class RealKeithley2636(AbstractSMU):
             self._dual_sync_script_loaded = True
             return
 
-        self._send_multiline(
-            """
-oai_dualsync = oai_dualsync or {}
-
-function oai_dualsync._prepare_buffers(smu)
-    smu.nvbuffer1.clear()
-    smu.nvbuffer1.clearcache()
-    smu.nvbuffer1.appendmode = 1
-    smu.nvbuffer1.collectsourcevalues = 1
-    smu.nvbuffer1.collecttimestamps = 1
-
-    smu.nvbuffer2.clear()
-    smu.nvbuffer2.clearcache()
-    smu.nvbuffer2.appendmode = 1
-    smu.nvbuffer2.collectsourcevalues = 1
-    smu.nvbuffer2.collecttimestamps = 1
-end
-
-function oai_dualsync._build_linear_list(start_v, stop_v, points)
-    local values = {}
-    local step_v = 0
-    if points > 1 then
-        step_v = (stop_v - start_v) / (points - 1)
-    end
-    for index = 1, points do
-        values[index] = start_v + (index - 1) * step_v
-    end
-    return values
-end
-
-function oai_dualsync._build_constant_list(level_v, points)
-    local values = {}
-    for index = 1, points do
-        values[index] = level_v
-    end
-    return values
-end
-
-function oai_dualsync.configure_block(
-    primary,
-    secondary,
-    primary_start,
-    primary_stop,
-    points,
-    step_delay,
-    primary_limit,
-    secondary_limit,
-    secondary_mode,
-    secondary_level,
-    secondary_start,
-    secondary_stop,
-    capture_primary_voltage,
-    capture_secondary_voltage
-)
-    local secondary_values
-
-    if secondary_mode == 1 then
-        secondary_values = oai_dualsync._build_linear_list(
-            secondary_start,
-            secondary_stop,
-            points
-        )
-    else
-        secondary_values = oai_dualsync._build_constant_list(secondary_level, points)
-    end
-
-    primary.abort()
-    secondary.abort()
-    primary.trigger.clear()
-    secondary.trigger.clear()
-    trigger.blender[1].reset()
-
-    oai_dualsync._prepare_buffers(primary)
-    oai_dualsync._prepare_buffers(secondary)
-
-    primary.source.func = primary.OUTPUT_DCVOLTS
-    secondary.source.func = secondary.OUTPUT_DCVOLTS
-
-    if primary_limit ~= nil and primary_limit > 0 then
-        primary.source.limiti = primary_limit
-    end
-    if secondary_limit ~= nil and secondary_limit > 0 then
-        secondary.source.limiti = secondary_limit
-    end
-
-    primary.source.levelv = primary_start
-    secondary.source.levelv = secondary_values[1]
-    primary.source.delay = step_delay
-    secondary.source.delay = step_delay
-
-    primary.trigger.source.linearv(primary_start, primary_stop, points)
-    secondary.trigger.source.listv(secondary_values)
-    primary.trigger.source.action = primary.ENABLE
-    secondary.trigger.source.action = secondary.ENABLE
-
-    if capture_primary_voltage ~= 0 then
-        primary.trigger.measure.iv(primary.nvbuffer1, primary.nvbuffer2)
-    else
-        primary.trigger.measure.i(primary.nvbuffer1)
-    end
-    if capture_secondary_voltage ~= 0 then
-        secondary.trigger.measure.iv(secondary.nvbuffer1, secondary.nvbuffer2)
-    else
-        secondary.trigger.measure.i(secondary.nvbuffer1)
-    end
-
-    primary.trigger.measure.action = primary.ENABLE
-    secondary.trigger.measure.action = secondary.ENABLE
-    primary.trigger.count = points
-    secondary.trigger.count = points
-    primary.trigger.arm.count = 1
-    secondary.trigger.arm.count = 1
-
-    primary.trigger.arm.stimulus = 0
-    secondary.trigger.arm.stimulus = primary.trigger.ARMED_EVENT_ID
-
-    primary.trigger.source.stimulus = 0
-    secondary.trigger.source.stimulus = 0
-
-    trigger.blender[1].orenable = false
-    trigger.blender[1].stimulus[1] = primary.trigger.SOURCE_COMPLETE_EVENT_ID
-    trigger.blender[1].stimulus[2] = secondary.trigger.SOURCE_COMPLETE_EVENT_ID
-    primary.trigger.measure.stimulus = trigger.blender[1].EVENT_ID
-    secondary.trigger.measure.stimulus = trigger.blender[1].EVENT_ID
-
-    primary.trigger.endsweep.action = primary.SOURCE_HOLD
-    secondary.trigger.endsweep.action = secondary.SOURCE_HOLD
-
-    primary.source.output = primary.OUTPUT_ON
-    secondary.source.output = secondary.OUTPUT_ON
-
-    secondary.trigger.initiate()
-    primary.trigger.initiate()
-end
-
-function oai_dualsync.wait_done()
-    waitcomplete()
-end
-            """
+        # FIX: Load the script as one named TSP script block.
+        self._load_tsp_script(
+            self.DUAL_SYNC_SCRIPT_NAME,
+            self._build_dual_sync_script(),
         )
         self._dual_sync_script_loaded = True
 
@@ -329,11 +366,14 @@ end
             rows.append(flat_values[index : index + column_count])
         return rows
 
-    def _format_tsp_value(self, value: float | int | None) -> str:
+    def _format_tsp_value(self, value: float | int | str | None) -> str:
         if value is None:
             return "nil"
         if isinstance(value, bool):
             return "1" if value else "0"
+        if isinstance(value, str):
+            # FIX: Quote string arguments so TSP receives a literal name instead of a bare global.
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         if isinstance(value, float):
             return repr(float(value))
         return str(value)
@@ -775,9 +815,10 @@ end
                 block_delay: float,
             ) -> None:
                 self._send_cmd_checked(
-                    "oai_dualsync.configure_block("
-                    f"{primary_channel}, "
-                    f"{secondary_channel}, "
+                    # FIX: Call the global TSP function to avoid named-script namespace collisions.
+                    "configure_block("
+                    f"{self._format_tsp_value(primary_channel)}, "
+                    f"{self._format_tsp_value(secondary_channel)}, "
                     f"{self._format_tsp_value(block_start)}, "
                     f"{self._format_tsp_value(block_stop)}, "
                     f"{block_points}, "
@@ -960,7 +1001,8 @@ end
 
                 _abort_if_requested()
                 self._query_cmd_checked(
-                    "oai_dualsync.wait_done() print(1)",
+                    # FIX: Call the global completion helper to avoid named-script namespace collisions.
+                    "wait_done() print(1)",
                     "waiting for sweep block completion",
                 )
                 self._source_levels[primary_channel] = float(block_stop)
