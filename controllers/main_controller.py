@@ -5,6 +5,7 @@ Main controller: connects MainWindowUI and AbstractSMU, binds signals and slots.
 import csv
 import json
 import time
+import traceback
 from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
@@ -26,6 +27,7 @@ class SweepWorker(QThread):
     """
 
     data_ready = Signal(dict)
+    error_occurred = Signal(str)
     finished_sweep = Signal()
     def __init__(
         self,
@@ -71,6 +73,23 @@ class SweepWorker(QThread):
         step_sweep_delay_s = max(0.0, step_sweep_delay)
 
         secondary_channel = "smub" if primary_channel == "smua" else "smua"
+
+        def abort_if_requested() -> None:
+            if not self.isInterruptionRequested():
+                return
+            try:
+                self.instrument.abort_sweep()
+            except Exception:
+                pass
+            raise InterruptedError("Sweep aborted by user.")
+
+        def sleep_with_abort(duration_s: float) -> None:
+            remaining_s = max(0.0, float(duration_s))
+            while remaining_s > 0.0:
+                abort_if_requested()
+                sleep_slice_s = min(0.05, remaining_s)
+                time.sleep(sleep_slice_s)
+                remaining_s -= sleep_slice_s
 
         def build_channel_values(
             requested_items: list[str],
@@ -180,6 +199,7 @@ class SweepWorker(QThread):
             use_ramp_down: bool,
         ) -> int:
             emitted_points = 0
+            abort_if_requested()
             for (
                 primary_source_chunk,
                 primary_current_chunk,
@@ -208,7 +228,9 @@ class SweepWorker(QThread):
                 None,
                 None,
                 stepper_limit,
+                abort_if_requested,
             ):
+                abort_if_requested()
                 emitted_points += emit_chunk_payloads(
                     started_at,
                     series_name,
@@ -249,6 +271,7 @@ class SweepWorker(QThread):
                 )
 
         try:
+            abort_if_requested()
             for channel in ("smua", "smub"):
                 self.instrument.configure_measurement(
                     channel,
@@ -264,7 +287,7 @@ class SweepWorker(QThread):
                 )
                 self.instrument.set_output(stepper_channel, True)
                 if step_sweep_delay_s > 0:
-                    time.sleep(step_sweep_delay_s)
+                    sleep_with_abort(step_sweep_delay_s)
 
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
                 run_primary_sweep(series_name, stepper_level)
@@ -284,15 +307,33 @@ class SweepWorker(QThread):
                             (stepper_vals, stepper_vals[-2::-1])
                         )
                 for step_val in stepper_vals:
+                    abort_if_requested()
                     self.instrument.set_voltage_source(
                         stepper_channel, float(step_val), stepper_limit
                     )
                     self.instrument.set_output(stepper_channel, True)
                     if step_sweep_delay_s > 0:
-                        time.sleep(step_sweep_delay_s)
+                        sleep_with_abort(step_sweep_delay_s)
 
                     series_name = f"{primary_name} (Step={step_val:.2f}V)"
                     run_primary_sweep(series_name, float(step_val))
+        except InterruptedError:
+            print("Sweep aborted by user.")
+        except Exception as exc:
+            print(f"Sweep failed: {exc}")
+            try:
+                error_queue = list(self.instrument.dump_errors())
+            except Exception as error_exc:
+                print(f"Failed to read instrument error queue: {error_exc}")
+            else:
+                if error_queue:
+                    print("Instrument error queue:")
+                    for index, error_entry in enumerate(error_queue, start=1):
+                        print(f"  {index}. {error_entry}")
+                else:
+                    print("Instrument error queue is empty.")
+            traceback.print_exc()
+            self.error_occurred.emit(str(exc))
         finally:
             # Ensure outputs are turned off and signal completion
             try:
@@ -327,6 +368,7 @@ class MainController:
         self.ui.export_config_btn.clicked.connect(self.handle_export_config)
         self.ui.reset_config_btn.clicked.connect(self.handle_reset_config)
         self.ui.run_btn.clicked.connect(self.handle_run)
+        self.ui.abort_btn.clicked.connect(self.handle_abort)
         self.ui.clear_plot_btn.clicked.connect(self.handle_clear_plot)
         self.ui.graph_linear_btn.clicked.connect(
             lambda: self.handle_graph_scale_change("linear")
@@ -957,9 +999,28 @@ class MainController:
         # Create and start worker thread
         self.worker = SweepWorker(self.instrument, params, parent=self.ui)
         self.worker.data_ready.connect(self.handle_new_data_point)
+        self.worker.error_occurred.connect(self.handle_sweep_error)
         self.worker.finished_sweep.connect(self.handle_sweep_finished)
 
         self.worker.start()
+
+    def handle_abort(self) -> None:
+        """Request an in-flight sweep to stop."""
+        worker = getattr(self, "worker", None)
+        if worker is None or not worker.isRunning():
+            self.ui.abort_btn.setEnabled(False)
+            self.ui.run_btn.setEnabled(True)
+            return
+        self.ui.abort_btn.setEnabled(False)
+        worker.requestInterruption()
+
+    def handle_sweep_error(self, message: str) -> None:
+        """Show sweep failures from the worker thread in the UI."""
+        QMessageBox.critical(
+            self.ui,
+            "Sweep Failed",
+            message or "The sweep failed. See terminal output for details.",
+        )
 
     def handle_new_data_point(self, payload: dict) -> None:
         """

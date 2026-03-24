@@ -10,7 +10,7 @@ chunked data streaming.
 import math
 import re
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 import pyvisa
 
@@ -29,8 +29,8 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_TIMEOUT_MS = 10000
     DEFAULT_POLL_INTERVAL_S = 0.02
     MIN_CHUNK_POINTS = 2
-    MAX_POINTS_PER_PRINTBUFFER = 8
-    MEASURE_EVERY_N_POINTS = 3
+    MAX_POINTS_PER_PRINTBUFFER = 1
+    MEASURE_EVERY_N_POINTS = 1
     DEFAULT_RESOURCE_ENCODING = "latin-1"
 
     def __init__(self, debug: bool = False) -> None:
@@ -86,6 +86,31 @@ class RealKeithley2636(AbstractSMU):
     def _send_multiline(self, script_text: str) -> None:
         self._send_cmd(script_text.strip())
 
+    def _error_queue_count(self) -> int:
+        if self.debug:
+            return 0
+        return int(float(self._query_cmd("print(errorqueue.count)")))
+
+    def _raise_if_error_queue(self, context: str) -> None:
+        count = self._error_queue_count()
+        if count <= 0:
+            return
+        errors = self.dump_errors()
+        message = [f"Instrument error after {context}."]
+        if errors:
+            message.append("Error queue:")
+            message.extend(f"  {index}. {entry}" for index, entry in enumerate(errors, start=1))
+        raise RuntimeError("\n".join(message))
+
+    def _send_cmd_checked(self, cmd: str, context: str) -> None:
+        self._send_cmd(cmd)
+        self._raise_if_error_queue(context)
+
+    def _query_cmd_checked(self, cmd: str, context: str) -> str:
+        reply = self._query_cmd(cmd)
+        self._raise_if_error_queue(context)
+        return reply
+
     def _ensure_ascii_stream_format(self) -> None:
         if self.debug:
             return
@@ -116,11 +141,21 @@ class RealKeithley2636(AbstractSMU):
         if self.debug:
             return []
         # FIX: Expose instrument error queue contents for field debugging.
-        count = int(float(self._query_cmd("print(errorqueue.count)")))
+        count = self._error_queue_count()
         errors: list[str] = []
         for _ in range(max(count, 0)):
             errors.append(self._query_cmd("print(errorqueue.next())"))
         return errors
+
+    def abort_sweep(self) -> None:
+        if self.debug:
+            print("[DEBUG] Abort sweep requested")
+            return
+        for cmd in ("smua.abort()", "smub.abort()"):
+            try:
+                self._send_cmd(cmd)
+            except Exception:
+                pass
 
     def _ensure_dual_sync_script_loaded(self) -> None:
         if self._dual_sync_script_loaded:
@@ -377,29 +412,44 @@ end
 
     def set_output(self, smu_channel: str, state: bool) -> None:
         on_off = "OUTPUT_ON" if state else "OUTPUT_OFF"
-        self._send_cmd(f"{smu_channel}.source.output = {smu_channel}.{on_off}")
+        self._send_cmd_checked(
+            f"{smu_channel}.source.output = {smu_channel}.{on_off}",
+            f"setting {smu_channel} output {str(state).lower()}",
+        )
 
     def set_voltage_source(
         self, smu_channel: str, voltage: float, current_limit: float
     ) -> None:
         if self._source_modes.get(smu_channel) != "voltage":
-            self._send_cmd(f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS")
+            self._send_cmd_checked(
+                f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCVOLTS",
+                f"configuring {smu_channel} voltage source mode",
+            )
             self._source_modes[smu_channel] = "voltage"
 
         last_limit = self._source_limits.get(smu_channel)
         if last_limit is None or abs(last_limit - float(current_limit)) > 1e-15:
-            self._send_cmd(f"{smu_channel}.source.limiti = {current_limit}")
+            self._send_cmd_checked(
+                f"{smu_channel}.source.limiti = {current_limit}",
+                f"setting {smu_channel} current limit",
+            )
             self._source_limits[smu_channel] = float(current_limit)
 
         last_level = self._source_levels.get(smu_channel)
         if last_level is None or abs(last_level - float(voltage)) > 1e-15:
-            self._send_cmd(f"{smu_channel}.source.levelv = {voltage}")
+            self._send_cmd_checked(
+                f"{smu_channel}.source.levelv = {voltage}",
+                f"setting {smu_channel} source voltage",
+            )
         self._source_levels[smu_channel] = float(voltage)
         if current_limit > 0:
             self._current_limits[smu_channel] = float(current_limit)
 
     def measure_current(self, smu_channel: str) -> float:
-        reply = self._query_cmd(f"print({smu_channel}.measure.i())")
+        reply = self._query_cmd_checked(
+            f"print({smu_channel}.measure.i())",
+            f"measuring current on {smu_channel}",
+        )
         return float(reply)
 
     def _measurement_range_amps(self, current_range: str) -> float | None:
@@ -446,24 +496,34 @@ end
             "AUTOZERO_AUTO",
         )
 
-        self._send_cmd(f"{smu_channel}.measure.nplc = {float(nplc)}")
-        self._send_cmd(
-            f"{smu_channel}.measure.autozero = {smu_channel}.{autozero_token}"
+        self._send_cmd_checked(
+            f"{smu_channel}.measure.nplc = {float(nplc)}",
+            f"setting {smu_channel} NPLC",
         )
-        self._send_cmd(
-            f"{smu_channel}.measure.filter.enable = {smu_channel}.FILTER_OFF"
+        self._send_cmd_checked(
+            f"{smu_channel}.measure.autozero = {smu_channel}.{autozero_token}",
+            f"setting {smu_channel} autozero",
+        )
+        self._send_cmd_checked(
+            f"{smu_channel}.measure.filter.enable = {smu_channel}.FILTER_OFF",
+            f"disabling {smu_channel} measurement filter",
         )
 
         range_amps = self._measurement_range_amps(current_range)
         if range_amps is None:
-            self._send_cmd(
-                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON"
+            self._send_cmd_checked(
+                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON",
+                f"enabling {smu_channel} current autorange",
             )
         else:
-            self._send_cmd(
-                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF"
+            self._send_cmd_checked(
+                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF",
+                f"disabling {smu_channel} current autorange",
             )
-            self._send_cmd(f"{smu_channel}.measure.rangei = {range_amps}")
+            self._send_cmd_checked(
+                f"{smu_channel}.measure.rangei = {range_amps}",
+                f"setting {smu_channel} current range",
+            )
 
     def measure_selected(
         self, smu_channel: str, measurement_items: list[str]
@@ -519,7 +579,10 @@ end
             return {}
 
         expr = ", ".join(f"{smu_channel}.measure.{suffix}()" for _, suffix in selected)
-        reply = self._query_cmd(f"print({expr})")
+        reply = self._query_cmd_checked(
+            f"print({expr})",
+            f"reading selected measurements on {smu_channel}",
+        )
         parts = [part for part in re.split(r"[\t,\r\n ]+", reply.strip()) if part]
 
         out: dict[str, float] = {}
@@ -549,6 +612,7 @@ end
         secondary_start_v: float | None = None,
         secondary_stop_v: float | None = None,
         secondary_current_limit: float | None = None,
+        stop_checker: Callable[[], bool] | None = None,
     ) -> Generator[
         tuple[
             list[float],
@@ -567,6 +631,7 @@ end
 
         self._ensure_ascii_stream_format()
         self._ensure_dual_sync_script_loaded()
+        self._raise_if_error_queue("preparing sweep")
 
         try:
             self._clear_error_state()
@@ -601,16 +666,43 @@ end
                 secondary_stop = secondary_level
                 secondary_mode_token = 0
 
+            def _abort_if_requested() -> None:
+                if stop_checker is None or not stop_checker():
+                    return
+                self.abort_sweep()
+                raise InterruptedError("Sweep aborted by user.")
+
             def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
-                self._send_cmd(f"{channel}.measure.nplc = {float(nplc)}")
-                self._send_cmd(f"{channel}.measure.filter.enable = {channel}.FILTER_OFF")
-                self._send_cmd(f"{channel}.measure.autozero = {channel}.AUTOZERO_ONCE")
-                self._send_cmd(f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF")
+                self._send_cmd_checked(
+                    f"{channel}.measure.nplc = {float(nplc)}",
+                    f"setting fast sweep NPLC on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.filter.enable = {channel}.FILTER_OFF",
+                    f"disabling fast sweep filter on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.autozero = {channel}.AUTOZERO_ONCE",
+                    f"arming autozero once on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF",
+                    f"disabling autozero on {channel}",
+                )
                 if limit_amps is not None and limit_amps > 0:
-                    self._send_cmd(f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF")
-                    self._send_cmd(f"{channel}.measure.rangei = {abs(limit_amps)}")
+                    self._send_cmd_checked(
+                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF",
+                        f"disabling current autorange during sweep on {channel}",
+                    )
+                    self._send_cmd_checked(
+                        f"{channel}.measure.rangei = {abs(limit_amps)}",
+                        f"setting sweep current range on {channel}",
+                    )
                 else:
-                    self._send_cmd(f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON")
+                    self._send_cmd_checked(
+                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON",
+                        f"enabling current autorange during sweep on {channel}",
+                    )
 
             def _build_linear_segment(
                 start_value: float,
@@ -650,8 +742,9 @@ end
                     secondary_voltage_index = len(columns)
                     columns.append(f"{secondary_channel}.nvbuffer2.readings")
 
-                reply = self._query_cmd(
-                    f"printbuffer({start_index}, {end_index}, {', '.join(columns)})"
+                reply = self._query_cmd_checked(
+                    f"printbuffer({start_index}, {end_index}, {', '.join(columns)})",
+                    f"reading sweep buffer rows {start_index}-{end_index}",
                 )
                 rows = self._reshape_printbuffer_rows(reply, len(columns))
 
@@ -681,7 +774,7 @@ end
                 block_points: int,
                 block_delay: float,
             ) -> None:
-                self._send_cmd(
+                self._send_cmd_checked(
                     "oai_dualsync.configure_block("
                     f"{primary_channel}, "
                     f"{secondary_channel}, "
@@ -696,7 +789,11 @@ end
                     f"{self._format_tsp_value(secondary_start)}, "
                     f"{self._format_tsp_value(secondary_stop)}, "
                     f"{1 if capture_primary_voltage else 0}, "
-                    f"{1 if capture_secondary_voltage else 0})"
+                    f"{1 if capture_secondary_voltage else 0})",
+                    (
+                        f"starting sweep block {block_start} V to {block_stop} V "
+                        f"with {block_points} points"
+                    ),
                 )
 
             def _debug_block_data(
@@ -790,7 +887,18 @@ end
                 while block_old_n < block_points:
                     # TODO: Consider SRQ/status-model driven completion to replace polling.
                     time.sleep(self.DEFAULT_POLL_INTERVAL_S)
-                    current_n = int(float(self._query_cmd(f"print({primary_channel}.nvbuffer1.n)")))
+                    _abort_if_requested()
+                    self._raise_if_error_queue(
+                        f"polling sweep progress on {primary_channel}"
+                    )
+                    current_n = int(
+                        float(
+                            self._query_cmd_checked(
+                                f"print({primary_channel}.nvbuffer1.n)",
+                                f"reading buffer count on {primary_channel}",
+                            )
+                        )
+                    )
                     current_n = min(current_n, block_points)
                     if current_n <= block_old_n:
                         continue
@@ -802,6 +910,7 @@ end
 
                     pull_start = block_old_n + 1
                     while pull_start <= current_n:
+                        _abort_if_requested()
                         # FIX: Cap each printbuffer request so the Keithley output queue cannot overflow.
                         pull_end = min(
                             pull_start + self.MAX_POINTS_PER_PRINTBUFFER - 1,
@@ -849,7 +958,11 @@ end
 
                     block_old_n = current_n
 
-                self._query_cmd("oai_dualsync.wait_done() print(1)")
+                _abort_if_requested()
+                self._query_cmd_checked(
+                    "oai_dualsync.wait_done() print(1)",
+                    "waiting for sweep block completion",
+                )
                 self._source_levels[primary_channel] = float(block_stop)
                 self._source_levels[secondary_channel] = float(
                     secondary_stop if secondary_mode_token == 1 else secondary_level
@@ -862,6 +975,7 @@ end
                 ramp_up_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
                 yield from _run_block(0.0, start_v, ramp_up_points, ru_delay)
 
+            _abort_if_requested()
             yield from _run_block(start_v, stop_v, points, delay)
 
             if ramp_down and abs(stop_v) > 0:

@@ -5,7 +5,7 @@ Implements AbstractSMU with no physical I/O; connect always succeeds,
 measurements return fake data.
 """
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 from core.instrument_base import AbstractSMU
 
@@ -70,6 +70,14 @@ class DummyKeithley2636(AbstractSMU):
         }
         return {item: values[item] for item in measurement_items if item in values}
 
+    def dump_errors(self) -> list[str]:
+        """Dummy driver has no instrument-side error queue."""
+        return []
+
+    def abort_sweep(self) -> None:
+        """Dummy driver has no active instrument sweep to abort."""
+        return None
+
     def run_iv_sweep(
         self,
         smu_channel: str,
@@ -91,6 +99,7 @@ class DummyKeithley2636(AbstractSMU):
         secondary_start_v: float | None = None,
         secondary_stop_v: float | None = None,
         secondary_current_limit: float | None = None,
+        stop_checker: Callable[[], bool] | None = None,
     ) -> Generator[
         tuple[
             list[float],
@@ -107,6 +116,8 @@ class DummyKeithley2636(AbstractSMU):
         """Yield one chunk of linear voltage sweep and fake currents."""
         if points < 1:
             return
+        if stop_checker is not None and stop_checker():
+            raise InterruptedError("Sweep aborted by user.")
         secondary_channel = "smub" if smu_channel == "smua" else "smua"
         step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
         voltages = [start_v + i * step for i in range(points)]

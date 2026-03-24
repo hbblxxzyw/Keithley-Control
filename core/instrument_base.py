@@ -6,6 +6,7 @@ for all real and virtual instruments.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Generator
 
 
@@ -116,6 +117,23 @@ class AbstractSMU(ABC):
         """
         pass
 
+    def dump_errors(self) -> list[str]:
+        """
+        Return instrument error queue entries, if supported.
+
+        Drivers without an instrument-side error queue may return an empty
+        list.
+        """
+        return []
+
+    def abort_sweep(self) -> None:
+        """
+        Abort the active sweep, if supported.
+
+        Drivers that do not maintain instrument-side sweep state may no-op.
+        """
+        return None
+
     @abstractmethod
     def run_iv_sweep(
         self,
@@ -138,6 +156,7 @@ class AbstractSMU(ABC):
         secondary_start_v: float | None = None,
         secondary_stop_v: float | None = None,
         secondary_current_limit: float | None = None,
+        stop_checker: Callable[[], bool] | None = None,
     ) -> Generator[
         tuple[
             list[float],
