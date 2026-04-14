@@ -135,6 +135,42 @@ class AbstractSMU(ABC):
         return None
 
     @abstractmethod
+    def run_single_smu_sweep(
+        self,
+        smu_channel: str,
+        start_v: float,
+        stop_v: float,
+        points: int,
+        delay: float = 0.0,
+        nplc: float = 1.0,
+        current_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        ramp_up: bool = False,
+        ru_step: float = 0.5,
+        ru_delay: float = 0.1,
+        ramp_down: bool = False,
+        rd_step: float = 0.5,
+        rd_delay: float = 0.1,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float],
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """
+        Run a linear voltage sweep on one enabled SMU only.
+
+        Implementations should explicitly turn the other SMU output off and
+        keep it out of the trigger model for the duration of this sweep.
+        """
+        pass
+
+    @abstractmethod
     def run_iv_sweep(
         self,
         smu_channel: str,

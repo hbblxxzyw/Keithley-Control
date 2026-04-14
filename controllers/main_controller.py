@@ -9,7 +9,7 @@ import traceback
 from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
 
 from core.instrument_base import AbstractSMU
@@ -68,6 +68,8 @@ class SweepWorker(QThread):
         rd_step: float = p["rd_step"]
         rd_delay: float = p["rd_delay"]
         measure_cfg: Dict[str, Dict[str, Any]] = p["measure_cfg"]
+        enabled_channels: list[str] = list(p.get("enabled_channels", ["smua", "smub"]))
+        single_smu: bool = bool(p.get("single_smu", False))
 
         delay_s = max(0.0, src_meas_delay)
         step_sweep_delay_s = max(0.0, step_sweep_delay)
@@ -127,8 +129,13 @@ class SweepWorker(QThread):
         ) -> dict[str, object]:
             smu1_values = primary_values if primary_channel == "smua" else secondary_values
             smu2_values = primary_values if primary_channel == "smub" else secondary_values
+            time_s = (
+                float(sample_timestamp)
+                if sample_timestamp is not None
+                else time.monotonic() - started_at
+            )
             payload: dict[str, object] = {
-                "time_s": time.monotonic() - started_at,
+                "time_s": time_s,
                 "series_name": series_name,
                 "primary_name": primary_name,
                 "stepper_name": stepper_name,
@@ -144,6 +151,37 @@ class SweepWorker(QThread):
             if sample_timestamp is not None:
                 payload["sample_t_s"] = sample_timestamp
             return payload
+
+        def emit_single_chunk_payloads(
+            started_at: float,
+            series_name: str,
+            source_values: list[float],
+            current_values: list[float],
+            measured_voltage_values: list[float] | None,
+            timestamp_values: list[float],
+        ) -> int:
+            primary_points = build_channel_values(
+                list(measure_cfg[primary_channel]["items"]),
+                source_values,
+                current_values,
+                measured_voltage_values,
+            )
+            emitted_points = 0
+            for index, (source_value, primary_values) in enumerate(
+                zip(source_values, primary_points)
+            ):
+                payload = build_payload(
+                    started_at,
+                    series_name,
+                    float(source_value),
+                    0.0,
+                    primary_values,
+                    {},
+                    float(timestamp_values[index]) if index < len(timestamp_values) else None,
+                )
+                self.data_ready.emit(payload)
+                emitted_points += 1
+            return emitted_points
 
         def emit_chunk_payloads(
             started_at: float,
@@ -200,6 +238,40 @@ class SweepWorker(QThread):
         ) -> int:
             emitted_points = 0
             abort_if_requested()
+            if single_smu:
+                for (
+                    source_chunk,
+                    current_chunk,
+                    voltage_chunk,
+                    timestamp_chunk,
+                ) in self.instrument.run_single_smu_sweep(
+                    primary_channel,
+                    sweep_start,
+                    sweep_stop,
+                    sweep_points,
+                    delay_s,
+                    nplc,
+                    primary_limit,
+                    list(measure_cfg[primary_channel]["items"]),
+                    use_ramp_up,
+                    ru_step,
+                    ru_delay,
+                    use_ramp_down,
+                    rd_step,
+                    rd_delay,
+                    abort_if_requested,
+                ):
+                    abort_if_requested()
+                    emitted_points += emit_single_chunk_payloads(
+                        started_at,
+                        series_name,
+                        list(source_chunk),
+                        list(current_chunk),
+                        None if voltage_chunk is None else list(voltage_chunk),
+                        list(timestamp_chunk),
+                    )
+                return emitted_points
+
             for (
                 primary_source_chunk,
                 primary_current_chunk,
@@ -272,7 +344,7 @@ class SweepWorker(QThread):
 
         try:
             abort_if_requested()
-            for channel in ("smua", "smub"):
+            for channel in enabled_channels:
                 self.instrument.configure_measurement(
                     channel,
                     list(measure_cfg[channel]["items"]),
@@ -280,8 +352,14 @@ class SweepWorker(QThread):
                     str(measure_cfg[channel]["autozero"]),
                     nplc,
                 )
+            if single_smu:
+                self.instrument.set_output(secondary_channel, False)
+                series_name = f"{primary_name} (Single)"
+                run_primary_sweep(series_name, 0.0)
+                return
+
             if stepper_mode == "fixed":
-                # ----- Branch A: Stepper Fixed → single sweep with bias -----
+                # ----- Branch A: fixed stepper bias -----
                 self.instrument.set_voltage_source(
                     stepper_channel, stepper_level, stepper_limit
                 )
@@ -292,7 +370,7 @@ class SweepWorker(QThread):
                 series_name = f"{primary_name} (Bias={stepper_level:.2f}V)"
                 run_primary_sweep(series_name, stepper_level)
             else:
-                # ----- Branch B: Stepper Sweep → nested family of curves -----
+                # ----- Branch B: swept stepper family of curves -----
                 n_stepper = max(1, int(stepper_points_assigned))
                 if n_stepper == 1:
                     stepper_vals = np.array([float(stepper_start)])
@@ -357,8 +435,15 @@ class MainController:
     def __init__(self, ui: "MainWindowUI", instrument: AbstractSMU) -> None:
         self.ui = ui
         self.instrument = instrument
+        self._connected = False
+        self._autoscale_after_first_point = False
         self.bind_signals()
         self.update_preview_and_summary()
+        self._auto_connect_timer = QTimer(self.ui)
+        self._auto_connect_timer.setInterval(1000)
+        self._auto_connect_timer.timeout.connect(self.try_auto_connect)
+        self._auto_connect_timer.start()
+        QTimer.singleShot(0, self.try_auto_connect)
 
     def bind_signals(self) -> None:
         """Bind UI signals: channel_config_changed and smu_selector change -> update summary and preview."""
@@ -370,6 +455,7 @@ class MainController:
         self.ui.run_btn.clicked.connect(self.handle_run)
         self.ui.abort_btn.clicked.connect(self.handle_abort)
         self.ui.clear_plot_btn.clicked.connect(self.handle_clear_plot)
+        self.ui.autoscale_btn.clicked.connect(self.handle_autoscale)
         self.ui.graph_linear_btn.clicked.connect(
             lambda: self.handle_graph_scale_change("linear")
         )
@@ -384,6 +470,10 @@ class MainController:
         """Clear only the Graph tab plot (keep table data)."""
         self.ui.graph_plot_placeholder.clear_plot()
 
+    def handle_autoscale(self) -> None:
+        """Autoscale the Graph tab plot."""
+        self.ui.graph_plot_placeholder.autoscale()
+
     def handle_graph_scale_change(self, mode: str) -> None:
         """Switch the measurement graph between linear and log current display."""
         normalized = "log" if str(mode).strip().lower() == "log" else "linear"
@@ -391,11 +481,26 @@ class MainController:
         self.ui.graph_log_btn.setChecked(normalized == "log")
         self.ui.graph_plot_placeholder.set_display_mode(normalized)
 
-    def handle_connect(self) -> None:
-        """Read address from UI, connect instrument, update status label to Connected (green)."""
-        resource_str = self.ui.resource_address_edit.text().strip()
-        if not resource_str:
-            return
+    def _set_connected_status(self, model_name: str | None = None) -> None:
+        status_text = "Connected"
+        if model_name:
+            status_text = f"Connected ({model_name})"
+        self.ui.connection_status_label.setText(status_text)
+        self.ui.connection_status_label.setStyleSheet(
+            "color: #2d7d2d; font-weight: bold;"
+        )
+        self.ui.run_btn.setEnabled(True)
+        self._connected = True
+
+    def _set_disconnected_status(self, text: str = "Disconnected") -> None:
+        self.ui.connection_status_label.setText(text)
+        self.ui.connection_status_label.setStyleSheet(
+            "color: gray; font-weight: bold;"
+        )
+        self.ui.run_btn.setEnabled(False)
+        self._connected = False
+
+    def _connect_resource(self, resource_str: str, *, quiet_failure: bool = False) -> bool:
         ok = self.instrument.connect(resource_str)
         if ok:
             model_getter = getattr(self.instrument, "get_model", None)
@@ -403,21 +508,54 @@ class MainController:
             set_model = getattr(self.ui, "set_instrument_model", None)
             if callable(set_model):
                 set_model(model_name)
+            self._set_connected_status(model_name)
+            timer = getattr(self, "_auto_connect_timer", None)
+            if timer is not None:
+                timer.stop()
+            return True
 
-            status_text = "Connected"
-            if model_name:
-                status_text = f"Connected ({model_name})"
-            self.ui.connection_status_label.setText(status_text)
-            self.ui.connection_status_label.setStyleSheet(
-                "color: #2d7d2d; font-weight: bold;"
-            )
-            self.ui.run_btn.setEnabled(True)
+        if quiet_failure:
+            self._set_disconnected_status("Scanning...")
         else:
             self.ui.connection_status_label.setText("Failed")
             self.ui.connection_status_label.setStyleSheet(
                 "color: #b71c1c; font-weight: bold;"
             )
             self.ui.run_btn.setEnabled(False)
+            self._connected = False
+        return False
+
+    def try_auto_connect(self) -> None:
+        """Periodically scan for a Keithley and connect silently when found."""
+        if self._connected:
+            timer = getattr(self, "_auto_connect_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+
+        finder = getattr(self.instrument, "find_resource_address", None)
+        if not callable(finder):
+            return
+
+        try:
+            resource_str = finder(preferred_serial="4399155")
+        except Exception:
+            return
+
+        if not resource_str:
+            if self.ui.connection_status_label.text() == "Disconnected":
+                self._set_disconnected_status("Scanning...")
+            return
+
+        self.ui.resource_address_edit.setText(resource_str)
+        self._connect_resource(resource_str, quiet_failure=True)
+
+    def handle_connect(self) -> None:
+        """Read address from UI, connect instrument, update status label to Connected (green)."""
+        resource_str = self.ui.resource_address_edit.text().strip()
+        if not resource_str:
+            return
+        self._connect_resource(resource_str)
 
     def handle_scan(self) -> None:
         """Scan VISA resources and populate the most likely Keithley 2636 address."""
@@ -544,7 +682,7 @@ class MainController:
         # ----- Limit suffix from Function (SMU 1 and SMU 2) -----
         func1 = str(self.ui.function_combo_smu1.currentText() or "").strip()
         func2 = str(self.ui.function_combo_smu2.currentText() or "").strip()
-        # 拦截信号，避免 setSuffix 触发的重绘/valueChanged 导致无限循环或静默崩溃
+        # Block suffix signals to avoid recursive refresh/valueChanged loops.
         self.ui.limit_spin_smu1.blockSignals(True)
         self.ui.limit_spin_smu1.setSuffix(" A" if func1 == "Voltage" else " V")
         self.ui.limit_spin_smu1.blockSignals(False)
@@ -565,6 +703,7 @@ class MainController:
         stop1 = self.ui.stop_spin_smu1.value()
         limit1 = self.ui.limit_spin_smu1.value()
         dual1 = self.ui.dual_sweep_check_smu1.isChecked()
+        enabled1 = self.ui.smu1_enable_group.isChecked()
 
         # ----- Read SMU 2 form -----
         mode2 = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
@@ -573,6 +712,7 @@ class MainController:
         stop2 = self.ui.stop_spin_smu2.value()
         limit2 = self.ui.limit_spin_smu2.value()
         dual2 = self.ui.dual_sweep_check_smu2.isChecked()
+        enabled2 = self.ui.smu2_enable_group.isChecked()
 
         # ----- Global sweep / stepper points & repeat -----
         sweep_points = int(self.ui.sweep_points_spin.value())
@@ -591,7 +731,28 @@ class MainController:
         pts1_base = 0
         pts2_base = 0
 
-        if stepper_text == "SMU 2":
+        if not enabled1 and not enabled2:
+            pts1_base = 0
+            pts2_base = 0
+            pri_dual = False
+            step_dual = False
+            pri_mode = "disabled"
+            step_mode = "disabled"
+        elif enabled1 and not enabled2:
+            pts1_base = sweep_points if mode1 == "sweep" else 0
+            pts2_base = 0
+            pri_dual = dual1
+            step_dual = False
+            pri_mode = mode1
+            step_mode = "disabled"
+        elif enabled2 and not enabled1:
+            pts1_base = 0
+            pts2_base = sweep_points if mode2 == "sweep" else 0
+            pri_dual = dual2
+            step_dual = False
+            pri_mode = mode2
+            step_mode = "disabled"
+        elif stepper_text == "SMU 2":
             # SMU1 = Primary, SMU2 = Stepper
             pts1_base = sweep_points
             pts2_base = stepper_points
@@ -652,9 +813,23 @@ class MainController:
                 return "None"
             return ", ".join(symbol_map.get(item, item) for item in items)
 
-        # Compute per-SMU step based on assigned base points (single-direction)
-        step1_val = compute_step(start1, stop1, pts1_base) if mode1 == "sweep" else 0.0
-        step2_val = compute_step(start2, stop2, pts2_base) if mode2 == "sweep" else 0.0
+        def display_points_for_smu(
+            smu_index: int,
+            enabled: bool,
+            mode: str,
+        ) -> int:
+            if not enabled or mode != "sweep":
+                return 0
+            if enabled1 and enabled2 and stepper_text == f"SMU {smu_index}":
+                return stepper_points
+            return sweep_points
+
+        # Step labels should describe each SMU's own sweep settings, even
+        # before the controller assigns primary/stepper execution roles.
+        step1_points = display_points_for_smu(1, enabled1, mode1)
+        step2_points = display_points_for_smu(2, enabled2, mode2)
+        step1_val = compute_step(start1, stop1, step1_points) if mode1 == "sweep" else 0.0
+        step2_val = compute_step(start2, stop2, step2_points) if mode2 == "sweep" else 0.0
 
         # Update read-only Step displays
         self.ui.step_display_smu1.setText(format_step(step1_val, func1))
@@ -665,8 +840,8 @@ class MainController:
         self.ui.dual_sweep_check_smu2.setVisible(mode2 == "sweep")
 
         # ----- Device Summary: SMU 1 -----
-        mode1_display = mode1.capitalize() if mode1 else "—"
-        self.ui.smu1_function_label.setText(func1 or "—")
+        mode1_display = mode1.capitalize() if mode1 else "-"
+        self.ui.smu1_function_label.setText(func1 or "-")
         self.ui.smu1_mode_label.setText(mode1_display)
         self.ui.smu1_measure_label.setText(
             format_measure_summary(self.ui.measure_combo_smu1.selected_items())
@@ -704,12 +879,12 @@ class MainController:
             self.ui.smu1_ramp_label.setText(ramp_text)
             self.ui.smu1_ramp_label.setVisible(True)
         else:
-            self.ui.smu1_ramp_label.setText("—")
+            self.ui.smu1_ramp_label.setText("-")
             self.ui.smu1_ramp_label.setVisible(False)
 
         # ----- Device Summary: SMU 2 -----
-        mode2_display = mode2.capitalize() if mode2 else "—"
-        self.ui.smu2_function_label.setText(func2 or "—")
+        mode2_display = mode2.capitalize() if mode2 else "-"
+        self.ui.smu2_function_label.setText(func2 or "-")
         self.ui.smu2_mode_label.setText(mode2_display)
         self.ui.smu2_measure_label.setText(
             format_measure_summary(self.ui.measure_combo_smu2.selected_items())
@@ -747,15 +922,39 @@ class MainController:
             self.ui.smu2_ramp_label.setText(ramp_text2)
             self.ui.smu2_ramp_label.setVisible(True)
         else:
-            self.ui.smu2_ramp_label.setText("—")
+            self.ui.smu2_ramp_label.setText("-")
             self.ui.smu2_ramp_label.setVisible(False)
 
+        def mark_summary_disabled(smu_index: int) -> None:
+            getattr(self.ui, f"smu{smu_index}_function_label").setText("Disabled")
+            getattr(self.ui, f"smu{smu_index}_mode_label").setText("Disabled")
+            getattr(self.ui, f"smu{smu_index}_source_label").setText("Output off")
+            getattr(self.ui, f"smu{smu_index}_limit_label").setText("-")
+            getattr(self.ui, f"smu{smu_index}_measure_label").setText("-")
+            getattr(self.ui, f"smu{smu_index}_ramp_label").setText("-")
+            getattr(self.ui, f"smu{smu_index}_ramp_label").setVisible(True)
+
+        if not enabled1:
+            mark_summary_disabled(1)
+        if not enabled2:
+            mark_summary_disabled(2)
+
         # ----- Calculated total points (global) -----
-        pri_actual_pts = int(pts1_base if stepper_text != "SMU 1" else pts2_base)
+        if enabled1 and not enabled2:
+            pri_actual_pts = int(pts1_base)
+            step_actual_pts = 0
+        elif enabled2 and not enabled1:
+            pri_actual_pts = int(pts2_base)
+            step_actual_pts = 0
+        elif not enabled1 and not enabled2:
+            pri_actual_pts = 0
+            step_actual_pts = 0
+        else:
+            pri_actual_pts = int(pts1_base if stepper_text != "SMU 1" else pts2_base)
+            step_actual_pts = int(pts2_base if stepper_text == "SMU 2" else pts1_base)
         if pri_mode == "sweep" and pri_actual_pts > 0 and pri_dual:
             pri_actual_pts = pri_actual_pts * 2 - 1
 
-        step_actual_pts = int(pts2_base if stepper_text == "SMU 2" else pts1_base)
         if step_mode == "sweep" and step_actual_pts > 0 and step_dual:
             step_actual_pts = step_actual_pts * 2 - 1
 
@@ -770,7 +969,9 @@ class MainController:
         src_meas_delay = float(self.ui.src_meas_delay_spin.value())
         step_sweep_delay = float(self.ui.step_sweep_delay_spin.value())
 
-        if mode1 == "fixed":
+        if not enabled1:
+            smu1_cfg = {"mode": "disabled"}
+        elif mode1 == "fixed":
             smu1_cfg = {
                 "mode": "fixed",
                 "level": level1,
@@ -789,7 +990,9 @@ class MainController:
                 "step_sweep_delay": step_sweep_delay,
                 "repeat": repeats,
             }
-        if mode2 == "fixed":
+        if not enabled2:
+            smu2_cfg = {"mode": "disabled"}
+        elif mode2 == "fixed":
             smu2_cfg = {
                 "mode": "fixed",
                 "level": level2,
@@ -845,8 +1048,69 @@ class MainController:
             stepper_points = 0
 
         # ----- Role assignment from UI -----
+        settings = self.ui.collect_settings()
+        smu1_enabled = bool(settings["smu1"].get("enabled", True))
+        smu2_enabled = bool(settings["smu2"].get("enabled", True))
+        enabled_channels = [
+            channel
+            for channel, enabled in (("smua", smu1_enabled), ("smub", smu2_enabled))
+            if enabled
+        ]
+        if not enabled_channels:
+            QMessageBox.warning(
+                self.ui,
+                "No SMU Enabled",
+                "Enable at least one SMU in Device Summary before running.",
+            )
+            self.ui.run_btn.setEnabled(True)
+            self.ui.abort_btn.setEnabled(False)
+            return
+
+        single_smu = len(enabled_channels) == 1
         stepper_text = str(self.ui.stepper_selector.currentText() or "").strip()
-        if stepper_text == "SMU 2":
+        if single_smu:
+            if smu1_enabled:
+                primary_name = "SMU 1"
+                stepper_name = "SMU 2"
+                primary_channel = "smua"
+                stepper_channel = "smub"
+                pri_start = self.ui.start_spin_smu1.value()
+                pri_stop = self.ui.stop_spin_smu1.value()
+                primary_limit = self.ui.limit_spin_smu1.value()
+                pri_mode = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
+                stepper_limit = self.ui.limit_spin_smu2.value()
+                primary_dual = self.ui.dual_sweep_check_smu1.isChecked()
+                ramp_up = self.ui.ramp_up_check_smu1.isChecked()
+                ru_step = float(self.ui.ramp_up_step_smu1.value())
+                ru_delay = float(self.ui.ramp_up_delay_smu1.value())
+                ramp_down = self.ui.ramp_down_check_smu1.isChecked()
+                rd_step = float(self.ui.ramp_down_step_smu1.value())
+                rd_delay = float(self.ui.ramp_down_delay_smu1.value())
+            else:
+                primary_name = "SMU 2"
+                stepper_name = "SMU 1"
+                primary_channel = "smub"
+                stepper_channel = "smua"
+                pri_start = self.ui.start_spin_smu2.value()
+                pri_stop = self.ui.stop_spin_smu2.value()
+                primary_limit = self.ui.limit_spin_smu2.value()
+                pri_mode = str(self.ui.mode_combo_smu2.currentText() or "").strip().lower()
+                stepper_limit = self.ui.limit_spin_smu1.value()
+                primary_dual = self.ui.dual_sweep_check_smu2.isChecked()
+                ramp_up = self.ui.ramp_up_check_smu2.isChecked()
+                ru_step = float(self.ui.ramp_up_step_smu2.value())
+                ru_delay = float(self.ui.ramp_up_delay_smu2.value())
+                ramp_down = self.ui.ramp_down_check_smu2.isChecked()
+                rd_step = float(self.ui.ramp_down_step_smu2.value())
+                rd_delay = float(self.ui.ramp_down_delay_smu2.value())
+            stepper_level = 0.0
+            stepper_start = 0.0
+            stepper_stop = 0.0
+            stepper_mode = "disabled"
+            primary_points = sweep_points
+            stepper_points_assigned = 0
+            stepper_dual = False
+        elif stepper_text == "SMU 2":
             primary_name = "SMU 1"
             stepper_name = "SMU 2"
             primary_channel = "smua"
@@ -955,14 +1219,17 @@ class MainController:
         # ----- Clear UI before starting -----
         self.ui.graph_plot_placeholder.clear_plot()
         self.ui.data_table.setRowCount(0)
+        self.ui.tab_widget.setCurrentWidget(self.ui.graph_tab)
+        self._autoscale_after_first_point = True
+        QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
 
         # Additional timing / measurement parameters
         src_meas_delay = float(self.ui.src_meas_delay_spin.value())
         step_sweep_delay = float(self.ui.step_sweep_delay_spin.value())
         nplc = float(self.ui.nplc_spin.value())
         measure_cfg = {
-            "smua": self.ui.collect_settings()["smu1"]["measure"],
-            "smub": self.ui.collect_settings()["smu2"]["measure"],
+            "smua": settings["smu1"]["measure"],
+            "smub": settings["smu2"]["measure"],
         }
 
         params: Dict[str, Any] = {
@@ -994,6 +1261,8 @@ class MainController:
             "rd_step": rd_step,
             "rd_delay": rd_delay,
             "measure_cfg": measure_cfg,
+            "enabled_channels": enabled_channels,
+            "single_smu": single_smu,
         }
 
         # Create and start worker thread
@@ -1054,6 +1323,9 @@ class MainController:
         row = self.ui.data_table.rowCount()
         self.ui.data_table.insertRow(row)
         self._fill_table_row(row, payload)
+        if self._autoscale_after_first_point:
+            self._autoscale_after_first_point = False
+            QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
 
     def handle_sweep_finished(self) -> None:
         """Restore Run/Abort button state after worker finishes."""

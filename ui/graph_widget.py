@@ -214,8 +214,17 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self._series[key].setData(xs, ys)
 
     def clear_plot(self) -> None:
-        """Clear all series data."""
-        for key in self._series:
-            self._data[key] = ([], [])
-            self._series[key].setData([], [])
+        """Clear all series and legend entries."""
+        for curve in list(self._series.values()):
+            self.removeItem(curve)
+        legend = self.plotItem.legend
+        if legend is not None:
+            legend.clear()
+        self._series.clear()
+        self._data.clear()
         self._color_index = {"SMU 1": 0, "SMU 2": 0}
+        self.autoscale()
+
+    def autoscale(self) -> None:
+        """Autoscale both axes to the currently plotted data."""
+        self.plotItem.autoRange()

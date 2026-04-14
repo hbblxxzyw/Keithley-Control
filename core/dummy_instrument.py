@@ -156,3 +156,49 @@ class DummyKeithley2636(AbstractSMU):
         )
         self._source_levels[smu_channel] = float(voltages[-1])
         self._source_levels[secondary_channel] = float(secondary_voltage)
+
+    def run_single_smu_sweep(
+        self,
+        smu_channel: str,
+        start_v: float,
+        stop_v: float,
+        points: int,
+        delay: float = 0.0,
+        nplc: float = 1.0,
+        current_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        ramp_up: bool = False,
+        ru_step: float = 0.5,
+        ru_delay: float = 0.1,
+        ramp_down: bool = False,
+        rd_step: float = 0.5,
+        rd_delay: float = 0.1,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float],
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """Yield one chunk of a single-channel sweep and fake currents."""
+        if points < 1:
+            return
+        if stop_checker is not None and stop_checker():
+            raise InterruptedError("Sweep aborted by user.")
+        inactive_channel = "smub" if smu_channel == "smua" else "smua"
+        self._source_levels[inactive_channel] = 0.0
+        step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
+        voltages = [start_v + i * step for i in range(points)]
+        currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
+        measured_voltages = None
+        timestamps = [float(index) * max(delay, 0.0) for index in range(points)]
+        if measurement_items and any(
+            item in {"Voltage", "Resistance"} for item in measurement_items
+        ):
+            measured_voltages = list(voltages)
+        yield (voltages, currents, measured_voltages, timestamps)
+        self._source_levels[smu_channel] = float(voltages[-1])

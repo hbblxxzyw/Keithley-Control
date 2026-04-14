@@ -28,8 +28,8 @@ class RealKeithley2636(AbstractSMU):
 
     DEFAULT_TIMEOUT_MS = 10000
     DEFAULT_POLL_INTERVAL_S = 0.02
-    MIN_CHUNK_POINTS = 2
-    MAX_POINTS_PER_PRINTBUFFER = 32
+    MIN_CHUNK_POINTS = 5
+    MAX_POINTS_PER_PRINTBUFFER = 5
     MEASURE_EVERY_N_POINTS = 8
     DEFAULT_RESOURCE_ENCODING = "latin-1"
     DUAL_SYNC_SCRIPT_NAME = "oai_dualsync"
@@ -232,14 +232,6 @@ function _lin(a, b, n)
     return vals
 end
 
-function _const(v, n)
-    local vals = {}
-    for i = 1, n do
-        vals[i] = v
-    end
-    return vals
-end
-
 function configure_block(pn, sn, p0, p1, n, dt, plim, slim, smode, slev, s0, s1, cpv, csv)
     local p = _G[pn]
     local s = _G[sn]
@@ -250,16 +242,20 @@ function configure_block(pn, sn, p0, p1, n, dt, plim, slim, smode, slev, s0, s1,
         error("Unknown secondary SMU: " .. tostring(sn))
     end
 
-    local svals
+    if dt == nil or dt < 0 then
+        dt = 0
+    end
+
+    local svals = nil
     if smode == 1 then
         svals = _lin(s0, s1, n)
-    else
-        svals = _const(slev, n)
     end
 
     p.abort()
     s.abort()
     trigger.blender[1].reset()
+    trigger.blender[2].reset()
+    trigger.timer[1].reset()
 
     _pb(p)
     _pb(s)
@@ -275,14 +271,24 @@ function configure_block(pn, sn, p0, p1, n, dt, plim, slim, smode, slev, s0, s1,
     end
 
     p.source.levelv = p0
-    s.source.levelv = svals[1]
-    p.source.delay = dt
-    s.source.delay = dt
+    if smode == 1 then
+        s.source.levelv = s0
+    else
+        s.source.levelv = slev
+    end
+    p.source.delay = 0
+    s.source.delay = 0
+    p.measure.delay = 0
+    s.measure.delay = 0
 
     p.trigger.source.linearv(p0, p1, n)
-    s.trigger.source.listv(svals)
     p.trigger.source.action = p.ENABLE
-    s.trigger.source.action = s.ENABLE
+    if smode == 1 then
+        s.trigger.source.listv(svals)
+        s.trigger.source.action = s.ENABLE
+    else
+        s.trigger.source.action = s.DISABLE
+    end
 
     if cpv ~= 0 then
         p.trigger.measure.iv(p.nvbuffer1, p.nvbuffer2)
@@ -303,17 +309,38 @@ function configure_block(pn, sn, p0, p1, n, dt, plim, slim, smode, slev, s0, s1,
     s.trigger.arm.count = 1
 
     p.trigger.arm.stimulus = 0
-    s.trigger.arm.stimulus = p.trigger.ARMED_EVENT_ID
+    s.trigger.arm.stimulus = 0
 
-    p.trigger.source.stimulus = 0
-    s.trigger.source.stimulus = 0
+    trigger.timer[1].delay = dt
+    trigger.timer[1].count = 1
+    trigger.timer[1].passthrough = false
+    trigger.timer[1].stimulus = p.trigger.SOURCE_COMPLETE_EVENT_ID
 
-    trigger.blender[1].orenable = false
-    trigger.blender[1].stimulus[1] = p.trigger.SOURCE_COMPLETE_EVENT_ID
-    trigger.blender[1].stimulus[2] = s.trigger.SOURCE_COMPLETE_EVENT_ID
-    p.trigger.measure.stimulus = trigger.blender[1].EVENT_ID
-    s.trigger.measure.stimulus = trigger.blender[1].EVENT_ID
+    p.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
+    s.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
 
+    trigger.blender[1].orenable = true
+    trigger.blender[1].stimulus[1] = p.trigger.ARMED_EVENT_ID
+    trigger.blender[1].stimulus[2] = p.trigger.PULSE_COMPLETE_EVENT_ID
+    p.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+    if smode == 1 then
+        s.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+    else
+        s.trigger.source.stimulus = 0
+    end
+
+    trigger.blender[2].orenable = false
+    trigger.blender[2].stimulus[1] = p.trigger.MEASURE_COMPLETE_EVENT_ID
+    trigger.blender[2].stimulus[2] = s.trigger.MEASURE_COMPLETE_EVENT_ID
+    p.trigger.endpulse.stimulus = trigger.blender[2].EVENT_ID
+    if smode == 1 then
+        s.trigger.endpulse.stimulus = trigger.blender[2].EVENT_ID
+    else
+        s.trigger.endpulse.stimulus = 0
+    end
+
+    p.trigger.endpulse.action = p.SOURCE_HOLD
+    s.trigger.endpulse.action = s.SOURCE_HOLD
     p.trigger.endsweep.action = p.SOURCE_HOLD
     s.trigger.endsweep.action = s.SOURCE_HOLD
 
@@ -322,6 +349,73 @@ function configure_block(pn, sn, p0, p1, n, dt, plim, slim, smode, slev, s0, s1,
 
     s.trigger.initiate()
     p.trigger.initiate()
+end
+
+function configure_single_block(cn, on, c0, c1, n, dt, clim, cpv)
+    local c = _G[cn]
+    local o = _G[on]
+    if c == nil then
+        error("Unknown active SMU: " .. tostring(cn))
+    end
+
+    if dt == nil or dt < 0 then
+        dt = 0
+    end
+
+    c.abort()
+    if o ~= nil then
+        o.abort()
+        o.source.output = o.OUTPUT_OFF
+        o.trigger.source.action = o.DISABLE
+        o.trigger.measure.action = o.DISABLE
+    end
+    trigger.blender[1].reset()
+    trigger.blender[2].reset()
+    trigger.timer[1].reset()
+
+    _pb(c)
+
+    c.source.func = c.OUTPUT_DCVOLTS
+    if clim ~= nil and clim > 0 then
+        c.source.limiti = clim
+    end
+
+    c.source.levelv = c0
+    c.source.delay = 0
+    c.measure.delay = 0
+
+    c.trigger.source.linearv(c0, c1, n)
+    c.trigger.source.action = c.ENABLE
+
+    if cpv ~= 0 then
+        c.trigger.measure.iv(c.nvbuffer1, c.nvbuffer2)
+    else
+        c.trigger.measure.i(c.nvbuffer1)
+    end
+
+    c.trigger.measure.action = c.ENABLE
+    c.trigger.count = n
+    c.trigger.arm.count = 1
+    c.trigger.arm.stimulus = 0
+
+    trigger.timer[1].delay = dt
+    trigger.timer[1].count = 1
+    trigger.timer[1].passthrough = false
+    trigger.timer[1].stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
+
+    c.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
+
+    trigger.blender[1].orenable = true
+    trigger.blender[1].stimulus[1] = c.trigger.ARMED_EVENT_ID
+    trigger.blender[1].stimulus[2] = c.trigger.PULSE_COMPLETE_EVENT_ID
+    c.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+
+    c.trigger.endpulse.stimulus = c.trigger.MEASURE_COMPLETE_EVENT_ID
+    c.trigger.endpulse.action = c.SOURCE_HOLD
+    c.trigger.endsweep.action = c.SOURCE_HOLD
+
+    c.source.output = c.OUTPUT_ON
+    c.trigger.initiate()
 end
 
 function wait_done()
@@ -631,6 +725,286 @@ end
         state["last"] = dict(out)
         return out
 
+    def run_single_smu_sweep(
+        self,
+        smu_channel: str,
+        start_v: float,
+        stop_v: float,
+        points: int,
+        delay: float = 0.0,
+        nplc: float = 1.0,
+        current_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        ramp_up: bool = False,
+        ru_step: float = 0.5,
+        ru_delay: float = 0.1,
+        ramp_down: bool = False,
+        rd_step: float = 0.5,
+        rd_delay: float = 0.1,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float],
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        if points < 1:
+            return
+
+        self._ensure_ascii_stream_format()
+        self._ensure_dual_sync_script_loaded()
+        self._raise_if_error_queue("preparing single-SMU sweep")
+
+        try:
+            self._clear_error_state()
+            active_channel = smu_channel
+            inactive_channel = "smub" if smu_channel == "smua" else "smua"
+            sweep_current_limit = current_limit
+            if sweep_current_limit is None:
+                sweep_current_limit = self._current_limits.get(active_channel)
+
+            requested_measurements = set(measurement_items or [])
+            capture_voltage = bool({"Voltage", "Resistance"} & requested_measurements)
+
+            def _abort_if_requested() -> None:
+                if stop_checker is None or not stop_checker():
+                    return
+                self.abort_sweep()
+                raise InterruptedError("Sweep aborted by user.")
+
+            def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
+                self._send_cmd_checked(
+                    f"{channel}.measure.nplc = {float(nplc)}",
+                    f"setting single sweep NPLC on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.filter.enable = {channel}.FILTER_OFF",
+                    f"disabling single sweep filter on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.autozero = {channel}.AUTOZERO_ONCE",
+                    f"arming autozero once on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF",
+                    f"disabling autozero on {channel}",
+                )
+                if limit_amps is not None and limit_amps > 0:
+                    self._send_cmd_checked(
+                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF",
+                        f"disabling current autorange during single sweep on {channel}",
+                    )
+                    self._send_cmd_checked(
+                        f"{channel}.measure.rangei = {abs(limit_amps)}",
+                        f"setting single sweep current range on {channel}",
+                    )
+                else:
+                    self._send_cmd_checked(
+                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON",
+                        f"enabling current autorange during single sweep on {channel}",
+                    )
+
+            def _build_linear_segment(
+                start_value: float,
+                stop_value: float,
+                total_points: int,
+                start_index: int,
+                end_index: int,
+            ) -> list[float]:
+                if end_index < start_index:
+                    return []
+                if total_points <= 1:
+                    return [float(start_value)] * max(end_index - start_index + 1, 0)
+                step_value = (float(stop_value) - float(start_value)) / float(total_points - 1)
+                return [
+                    float(start_value) + step_value * (point_index - 1)
+                    for point_index in range(start_index, end_index + 1)
+                ]
+
+            def _pull_chunk(start_index: int, end_index: int) -> tuple[
+                list[float],
+                list[float] | None,
+                list[float],
+            ]:
+                columns = [
+                    f"{active_channel}.nvbuffer1.readings",
+                    f"{active_channel}.nvbuffer1.timestamps",
+                ]
+                timestamp_index = 1
+                voltage_index: int | None = None
+                if capture_voltage:
+                    voltage_index = len(columns)
+                    columns.append(f"{active_channel}.nvbuffer2.readings")
+
+                reply = self._query_cmd_checked(
+                    f"printbuffer({start_index}, {end_index}, {', '.join(columns)})",
+                    f"reading single sweep buffer rows {start_index}-{end_index}",
+                )
+                rows = self._reshape_printbuffer_rows(reply, len(columns))
+                currents = [row[0] for row in rows]
+                timestamps = [row[timestamp_index] for row in rows]
+                measured_voltages = (
+                    None
+                    if voltage_index is None
+                    else [row[voltage_index] for row in rows]
+                )
+                return currents, measured_voltages, timestamps
+
+            def _start_block(
+                block_start: float,
+                block_stop: float,
+                block_points: int,
+                block_delay: float,
+            ) -> None:
+                self._send_cmd_checked(
+                    "configure_single_block("
+                    f"{self._format_tsp_value(active_channel)}, "
+                    f"{self._format_tsp_value(inactive_channel)}, "
+                    f"{self._format_tsp_value(block_start)}, "
+                    f"{self._format_tsp_value(block_stop)}, "
+                    f"{block_points}, "
+                    f"{self._format_tsp_value(block_delay)}, "
+                    f"{self._format_tsp_value(sweep_current_limit)}, "
+                    f"{1 if capture_voltage else 0})",
+                    (
+                        f"starting single-SMU sweep block {block_start} V to "
+                        f"{block_stop} V with {block_points} points"
+                    ),
+                )
+
+            def _debug_block_data(
+                block_start: float,
+                block_stop: float,
+                block_points: int,
+                block_delay: float,
+            ) -> tuple[list[float], list[float], list[float] | None, list[float]]:
+                if block_points <= 1:
+                    source_values = [float(block_start)]
+                else:
+                    step_v = (block_stop - block_start) / float(block_points - 1)
+                    source_values = [
+                        float(block_start) + step_v * index for index in range(block_points)
+                    ]
+                currents = [
+                    1.23e-6 + (value - float(block_start)) * 1e-7
+                    for value in source_values
+                ]
+                measured_voltages = list(source_values) if capture_voltage else None
+                timestamps = [
+                    float(index) * max(float(block_delay), 0.0) for index in range(block_points)
+                ]
+                return source_values, currents, measured_voltages, timestamps
+
+            def _run_block(
+                block_start: float,
+                block_stop: float,
+                block_points: int,
+                block_delay: float,
+            ) -> Generator[
+                tuple[list[float], list[float], list[float] | None, list[float]],
+                None,
+                None,
+            ]:
+                if block_points < 1:
+                    return
+
+                if self.debug:
+                    time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                    yield _debug_block_data(block_start, block_stop, block_points, block_delay)
+                    self._source_levels[active_channel] = float(block_stop)
+                    self._source_levels[inactive_channel] = 0.0
+                    return
+
+                _start_block(block_start, block_stop, block_points, block_delay)
+                block_old_n = 0
+                while block_old_n < block_points:
+                    time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                    _abort_if_requested()
+                    self._raise_if_error_queue(
+                        f"polling single sweep progress on {active_channel}"
+                    )
+                    current_n = int(
+                        float(
+                            self._query_cmd_checked(
+                                f"print({active_channel}.nvbuffer1.n)",
+                                f"reading buffer count on {active_channel}",
+                            )
+                        )
+                    )
+                    current_n = min(current_n, block_points)
+                    if current_n <= block_old_n:
+                        continue
+                    if (
+                        current_n < block_points
+                        and current_n - block_old_n < self.MIN_CHUNK_POINTS
+                    ):
+                        continue
+
+                    pull_start = block_old_n + 1
+                    while pull_start <= current_n:
+                        _abort_if_requested()
+                        pull_end = min(
+                            pull_start + self.MAX_POINTS_PER_PRINTBUFFER - 1,
+                            current_n,
+                        )
+                        currents, measured_voltages, timestamps = _pull_chunk(
+                            pull_start,
+                            pull_end,
+                        )
+                        if currents:
+                            actual_pull_end = pull_start + len(currents) - 1
+                            source_values = _build_linear_segment(
+                                block_start,
+                                block_stop,
+                                block_points,
+                                pull_start,
+                                actual_pull_end,
+                            )
+                            yield (
+                                source_values,
+                                currents,
+                                measured_voltages,
+                                timestamps,
+                            )
+                        pull_start = pull_end + 1
+
+                    block_old_n = current_n
+
+                _abort_if_requested()
+                self._query_cmd_checked(
+                    "wait_done() print(1)",
+                    "waiting for single sweep block completion",
+                )
+                self._source_levels[active_channel] = float(block_stop)
+                self._source_levels[inactive_channel] = 0.0
+
+            _configure_fast_measurement(active_channel, sweep_current_limit)
+            self._send_cmd_checked(
+                f"{inactive_channel}.source.output = {inactive_channel}.OUTPUT_OFF",
+                f"turning off inactive {inactive_channel}",
+            )
+
+            if ramp_up and abs(start_v) > 0:
+                ramp_up_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
+                yield from _run_block(0.0, start_v, ramp_up_points, ru_delay)
+
+            _abort_if_requested()
+            yield from _run_block(start_v, stop_v, points, delay)
+
+            if ramp_down and abs(stop_v) > 0:
+                ramp_down_points = max(
+                    2,
+                    int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1,
+                )
+                yield from _run_block(stop_v, 0.0, ramp_down_points, rd_delay)
+        except Exception:
+            self._recover_from_sweep_error()
+            raise
+
     def run_iv_sweep(
         self,
         smu_channel: str,
@@ -766,9 +1140,13 @@ end
                 list[float] | None,
                 list[float],
                 list[float] | None,
+                list[float],
             ]:
-                # FIX: Only fetch essential readings during realtime streaming to keep the output queue small.
-                columns = [f"{primary_channel}.nvbuffer1.readings"]
+                columns = [
+                    f"{primary_channel}.nvbuffer1.readings",
+                    f"{primary_channel}.nvbuffer1.timestamps",
+                ]
+                primary_timestamp_index = 1
                 primary_voltage_index: int | None = None
                 if capture_primary_voltage:
                     primary_voltage_index = len(columns)
@@ -789,6 +1167,7 @@ end
                 rows = self._reshape_printbuffer_rows(reply, len(columns))
 
                 primary_currents = [row[0] for row in rows]
+                primary_timestamps = [row[primary_timestamp_index] for row in rows]
                 primary_measured_voltages = (
                     None
                     if primary_voltage_index is None
@@ -806,6 +1185,7 @@ end
                     primary_measured_voltages,
                     secondary_currents,
                     secondary_measured_voltages,
+                    primary_timestamps,
                 )
 
             def _start_block(
@@ -932,7 +1312,7 @@ end
                     self._raise_if_error_queue(
                         f"polling sweep progress on {primary_channel}"
                     )
-                    current_n = int(
+                    primary_n = int(
                         float(
                             self._query_cmd_checked(
                                 f"print({primary_channel}.nvbuffer1.n)",
@@ -940,7 +1320,15 @@ end
                             )
                         )
                     )
-                    current_n = min(current_n, block_points)
+                    secondary_n = int(
+                        float(
+                            self._query_cmd_checked(
+                                f"print({secondary_channel}.nvbuffer1.n)",
+                                f"reading buffer count on {secondary_channel}",
+                            )
+                        )
+                    )
+                    current_n = min(primary_n, secondary_n, block_points)
                     if current_n <= block_old_n:
                         continue
                     if (
@@ -962,6 +1350,7 @@ end
                             primary_measured_voltages,
                             secondary_currents,
                             secondary_measured_voltages,
+                            primary_timestamps,
                         ) = _pull_chunk(pull_start, pull_end)
                         if primary_currents:
                             actual_pull_end = pull_start + len(primary_currents) - 1
@@ -992,7 +1381,7 @@ end
                                 secondary_source_values,
                                 secondary_currents,
                                 secondary_measured_voltages,
-                                [],  # FIX: Do not stream timestamps in realtime; keep payload minimal.
+                                primary_timestamps,
                             )
 
                         pull_start = pull_end + 1

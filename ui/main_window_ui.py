@@ -290,7 +290,13 @@ class MainWindowUI(QMainWindow):
     def _apply_common_settings_state(self) -> None:
         mode1 = self._mode_text(1)
         mode2 = self._mode_text(2)
-        sweep_modes = [idx for idx, mode in ((1, mode1), (2, mode2)) if mode == "sweep"]
+        enabled1 = bool(self.smu1_enable_group.isChecked())
+        enabled2 = bool(self.smu2_enable_group.isChecked())
+        sweep_modes = [
+            idx
+            for idx, mode, enabled in ((1, mode1, enabled1), (2, mode2, enabled2))
+            if enabled and mode == "sweep"
+        ]
 
         self.sweep_points_spin.setEnabled(bool(sweep_modes))
 
@@ -333,6 +339,8 @@ class MainWindowUI(QMainWindow):
             self.stepper_points_spin,
             self.repeat_spin,
             self.smu_selector,
+            self.smu1_enable_group,
+            self.smu2_enable_group,
         ]
         for i in (1, 2):
             widgets.extend(
@@ -376,6 +384,7 @@ class MainWindowUI(QMainWindow):
 
     def _collect_smu_settings(self, smu_index: int) -> dict:
         return {
+            "enabled": bool(getattr(self, f"smu{smu_index}_enable_group").isChecked()),
             "function": str(getattr(self, f"function_combo_smu{smu_index}").currentText()),
             "mode": str(getattr(self, f"mode_combo_smu{smu_index}").currentText()),
             "dual": bool(getattr(self, f"dual_sweep_check_smu{smu_index}").isChecked()),
@@ -416,6 +425,9 @@ class MainWindowUI(QMainWindow):
 
             for smu_index in (1, 2):
                 smu_cfg = settings.get(f"smu{smu_index}", {})
+                getattr(self, f"smu{smu_index}_enable_group").setChecked(
+                    bool(smu_cfg.get("enabled", True))
+                )
                 getattr(self, f"function_combo_smu{smu_index}").setCurrentText(
                     str(smu_cfg.get("function", getattr(self, f"function_combo_smu{smu_index}").currentText()))
                 )
@@ -602,6 +614,9 @@ class MainWindowUI(QMainWindow):
 
         # SMU 1 status: Function, Mode, Source, Limit, Ramp
         smu1_group = QGroupBox("SMU 1")
+        smu1_group.setCheckable(True)
+        smu1_group.setChecked(True)
+        smu1_group.setToolTip("Enable SMU 1 for the next run")
         smu1_layout = QFormLayout(smu1_group)
         self.smu1_function_label = QLabel("—")
         self.smu1_mode_label = QLabel("—")
@@ -616,9 +631,13 @@ class MainWindowUI(QMainWindow):
         smu1_layout.addRow("Measure:", self.smu1_measure_label)
         smu1_layout.addRow("Ramp:", self.smu1_ramp_label)
         summary_layout.addWidget(smu1_group)
+        self.smu1_enable_group = smu1_group
 
         # SMU 2 status: Function, Mode, Source, Limit, Ramp
         smu2_group = QGroupBox("SMU 2")
+        smu2_group.setCheckable(True)
+        smu2_group.setChecked(True)
+        smu2_group.setToolTip("Enable SMU 2 for the next run")
         smu2_layout = QFormLayout(smu2_group)
         self.smu2_function_label = QLabel("—")
         self.smu2_mode_label = QLabel("—")
@@ -633,6 +652,7 @@ class MainWindowUI(QMainWindow):
         smu2_layout.addRow("Measure:", self.smu2_measure_label)
         smu2_layout.addRow("Ramp:", self.smu2_ramp_label)
         summary_layout.addWidget(smu2_group)
+        self.smu2_enable_group = smu2_group
 
         summary_layout.addStretch()
         lower_layout.addWidget(summary_group, 1)
@@ -823,7 +843,7 @@ class MainWindowUI(QMainWindow):
         form.addRow("Stop:", stop_spin)
 
         step_display = QLabel("0.000 V")
-        step_display.setStyleSheet("color: white; padding: 2px;")
+        step_display.setStyleSheet("color: #202124; padding: 2px;")
         form.addRow("Step:", step_display)
 
         limit_spin = ScientificDoubleSpinBox()
@@ -883,6 +903,10 @@ class MainWindowUI(QMainWindow):
             getattr(self, f"ramp_up_check_smu{i}").stateChanged.connect(self._refresh_dynamic_ui_state)
             getattr(self, f"ramp_down_check_smu{i}").stateChanged.connect(self._refresh_dynamic_ui_state)
 
+        self.smu1_enable_group.toggled.connect(self.emit_config_changed)
+        self.smu2_enable_group.toggled.connect(self.emit_config_changed)
+        self.smu1_enable_group.toggled.connect(self._refresh_dynamic_ui_state)
+        self.smu2_enable_group.toggled.connect(self._refresh_dynamic_ui_state)
         self.stepper_selector.currentTextChanged.connect(self._refresh_dynamic_ui_state)
         self._refresh_dynamic_ui_state()
 
