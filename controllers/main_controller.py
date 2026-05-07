@@ -437,6 +437,7 @@ class MainController:
         self.instrument = instrument
         self._connected = False
         self._autoscale_after_first_point = False
+        self._syncing_step_controls = False
         self.bind_signals()
         self.update_preview_and_summary()
         self._auto_connect_timer = QTimer(self.ui)
@@ -465,6 +466,84 @@ class MainController:
         self.ui.export_csv_btn.clicked.connect(self.handle_export_csv)
         self.ui.channel_config_changed.connect(self.update_preview_and_summary)
         self.ui.smu_selector.currentIndexChanged.connect(self.update_preview_and_summary)
+        self.ui.step_display_smu1.valueChanged.connect(
+            lambda value: self.handle_step_value_changed(1, value)
+        )
+        self.ui.step_display_smu2.valueChanged.connect(
+            lambda value: self.handle_step_value_changed(2, value)
+        )
+
+    def handle_step_value_changed(self, smu_index: int, requested_step: float) -> None:
+        if self._syncing_step_controls:
+            return
+
+        mode = str(
+            getattr(self.ui, f"mode_combo_smu{smu_index}").currentText() or ""
+        ).strip().lower()
+        enabled = bool(getattr(self.ui, f"smu{smu_index}_enable_group").isChecked())
+        if not enabled or mode != "sweep":
+            return
+
+        start = float(getattr(self.ui, f"start_spin_smu{smu_index}").value())
+        stop = float(getattr(self.ui, f"stop_spin_smu{smu_index}").value())
+        span = abs(stop - start)
+        step = abs(float(requested_step))
+        if span <= 0.0 or step <= 0.0:
+            self.update_preview_and_summary()
+            return
+
+        points_spin = self._points_spin_for_smu(smu_index)
+        if points_spin is None:
+            self.update_preview_and_summary()
+            return
+
+        intervals = max(1, int(round(span / step)))
+        points = intervals + 1
+        points = max(points_spin.minimum(), min(points_spin.maximum(), points))
+
+        self._syncing_step_controls = True
+        try:
+            points_spin.blockSignals(True)
+            points_spin.setValue(points)
+        finally:
+            points_spin.blockSignals(False)
+            self._syncing_step_controls = False
+
+        self.update_preview_and_summary()
+
+    def _points_spin_for_smu(self, smu_index: int):
+        mode = str(
+            getattr(self.ui, f"mode_combo_smu{smu_index}").currentText() or ""
+        ).strip().lower()
+        enabled = bool(getattr(self.ui, f"smu{smu_index}_enable_group").isChecked())
+        if not enabled or mode != "sweep":
+            return None
+
+        enabled1 = bool(self.ui.smu1_enable_group.isChecked())
+        enabled2 = bool(self.ui.smu2_enable_group.isChecked())
+        stepper_text = str(self.ui.stepper_selector.currentText() or "").strip()
+        if enabled1 and enabled2 and stepper_text == f"SMU {smu_index}":
+            return self.ui.stepper_points_spin
+        return self.ui.sweep_points_spin
+
+    def _set_step_control_value(
+        self,
+        smu_index: int,
+        step_value: float,
+        function_type: str,
+        enabled: bool,
+    ) -> None:
+        step_spin = getattr(self.ui, f"step_display_smu{smu_index}")
+        suffix = " V" if function_type == "Voltage" else " A"
+        self._syncing_step_controls = True
+        try:
+            step_spin.blockSignals(True)
+            step_spin.setSuffix(suffix)
+            step_spin.setValue(abs(float(step_value)))
+            step_spin.setEnabled(enabled)
+        finally:
+            step_spin.blockSignals(False)
+            self._syncing_step_controls = False
 
     def handle_clear_plot(self) -> None:
         """Clear only the Graph tab plot (keep table data)."""
@@ -831,9 +910,8 @@ class MainController:
         step1_val = compute_step(start1, stop1, step1_points) if mode1 == "sweep" else 0.0
         step2_val = compute_step(start2, stop2, step2_points) if mode2 == "sweep" else 0.0
 
-        # Update read-only Step displays
-        self.ui.step_display_smu1.setText(format_step(step1_val, func1))
-        self.ui.step_display_smu2.setText(format_step(step2_val, func2))
+        self._set_step_control_value(1, step1_val, func1, enabled1 and mode1 == "sweep")
+        self._set_step_control_value(2, step2_val, func2, enabled2 and mode2 == "sweep")
 
         # ----- Show/hide Dual Sweep checkbox (only when mode is Sweep) -----
         self.ui.dual_sweep_check_smu1.setVisible(mode1 == "sweep")

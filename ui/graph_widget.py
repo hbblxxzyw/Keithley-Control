@@ -4,6 +4,8 @@ Pyqtgraph-based plot widgets: preview waveform (Settings tab) and I-V measuremen
 
 import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import QPointF
+from PySide6.QtWidgets import QToolTip
 from pyqtgraph import PlotDataItem
 
 
@@ -157,6 +159,12 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self._data: dict[tuple[str, str], tuple[list[float], list[float]]] = {}
         self._color_index: dict[str, int] = {"SMU 1": 0, "SMU 2": 0}
         self._display_mode = "linear"
+        self._hover_distance_px = 10.0
+        self._hover_proxy = pg.SignalProxy(
+            self.scene().sigMouseMoved,
+            rateLimit=60,
+            slot=self._handle_mouse_moved,
+        )
         self._palette = {
             "SMU 1": ["#1565c0", "#00838f", "#3949ab", "#0277bd"],
             "SMU 2": ["#c62828", "#ef6c00", "#ad1457", "#6d4c41"],
@@ -212,6 +220,68 @@ class MeasurementGraphWidget(pg.PlotWidget):
             self._series[key].setData(log_xs, log_ys)
             return
         self._series[key].setData(xs, ys)
+
+    def _handle_mouse_moved(self, event) -> None:
+        scene_pos = event[0]
+        if not self.plotItem.sceneBoundingRect().contains(scene_pos):
+            QToolTip.hideText()
+            return
+
+        nearest = self._nearest_plotted_point(scene_pos)
+        if nearest is None:
+            QToolTip.hideText()
+            return
+
+        smu_name, series_name, x_val, y_val = nearest
+        widget_pos = self.mapFromScene(scene_pos)
+        global_pos = self.mapToGlobal(widget_pos)
+        QToolTip.showText(
+            global_pos,
+            (
+                f"{smu_name} | {series_name}\n"
+                f"X: {self._format_axis_value(x_val)} V\n"
+                f"Y: {self._format_axis_value(y_val)} A"
+            ),
+            self,
+        )
+
+    def _nearest_plotted_point(
+        self, scene_pos: QPointF
+    ) -> tuple[str, str, float, float] | None:
+        best: tuple[float, str, str, float, float] | None = None
+        for key, curve in self._series.items():
+            x_data, y_data = curve.getData()
+            if x_data is None or y_data is None:
+                continue
+            for x_val, y_val in zip(x_data, y_data):
+                try:
+                    x_float = float(x_val)
+                    y_float = float(y_val)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(x_float) or not np.isfinite(y_float):
+                    continue
+                point_pos = self.plotItem.vb.mapViewToScene(
+                    QPointF(x_float, y_float)
+                )
+                distance = (
+                    (point_pos.x() - scene_pos.x()) ** 2
+                    + (point_pos.y() - scene_pos.y()) ** 2
+                ) ** 0.5
+                if distance <= self._hover_distance_px and (
+                    best is None or distance < best[0]
+                ):
+                    smu_name, series_name = key
+                    best = (distance, smu_name, series_name, x_float, y_float)
+
+        if best is None:
+            return None
+        _, smu_name, series_name, x_val, y_val = best
+        return smu_name, series_name, x_val, y_val
+
+    @staticmethod
+    def _format_axis_value(value: float) -> str:
+        return f"{float(value):.6g}"
 
     def clear_plot(self) -> None:
         """Clear all series and legend entries."""

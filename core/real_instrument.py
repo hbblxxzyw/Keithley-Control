@@ -602,6 +602,24 @@ end
         }
         return range_map.get(str(current_range or "").strip())
 
+    def _apply_current_measure_range(self, smu_channel: str) -> None:
+        state = self._measure_state.get(smu_channel, {})
+        range_amps = state.get("range_amps")
+        if isinstance(range_amps, (int, float)) and range_amps > 0:
+            self._send_cmd_checked(
+                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF",
+                f"disabling {smu_channel} current autorange",
+            )
+            self._send_cmd_checked(
+                f"{smu_channel}.measure.rangei = {float(range_amps)}",
+                f"setting {smu_channel} current range",
+            )
+        else:
+            self._send_cmd_checked(
+                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON",
+                f"enabling {smu_channel} current autorange",
+            )
+
     def configure_measurement(
         self,
         smu_channel: str,
@@ -610,13 +628,13 @@ end
         autozero: str,
         nplc: float,
     ) -> None:
-        if not measurement_items:
-            return
-
+        range_amps = self._measurement_range_amps(current_range)
         self._measure_state[smu_channel] = {
             "count": 0,
             "signature": tuple(measurement_items),
             "last": {},
+            "current_range": str(current_range or "").strip() or "Auto",
+            "range_amps": range_amps,
         }
 
         autozero_map = {
@@ -643,21 +661,7 @@ end
             f"disabling {smu_channel} measurement filter",
         )
 
-        range_amps = self._measurement_range_amps(current_range)
-        if range_amps is None:
-            self._send_cmd_checked(
-                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_ON",
-                f"enabling {smu_channel} current autorange",
-            )
-        else:
-            self._send_cmd_checked(
-                f"{smu_channel}.measure.autorangei = {smu_channel}.AUTORANGE_OFF",
-                f"disabling {smu_channel} current autorange",
-            )
-            self._send_cmd_checked(
-                f"{smu_channel}.measure.rangei = {range_amps}",
-                f"setting {smu_channel} current range",
-            )
+        self._apply_current_measure_range(smu_channel)
 
     def measure_selected(
         self, smu_channel: str, measurement_items: list[str]
@@ -776,7 +780,7 @@ end
                 self.abort_sweep()
                 raise InterruptedError("Sweep aborted by user.")
 
-            def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
+            def _configure_fast_measurement(channel: str) -> None:
                 self._send_cmd_checked(
                     f"{channel}.measure.nplc = {float(nplc)}",
                     f"setting single sweep NPLC on {channel}",
@@ -793,20 +797,7 @@ end
                     f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF",
                     f"disabling autozero on {channel}",
                 )
-                if limit_amps is not None and limit_amps > 0:
-                    self._send_cmd_checked(
-                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF",
-                        f"disabling current autorange during single sweep on {channel}",
-                    )
-                    self._send_cmd_checked(
-                        f"{channel}.measure.rangei = {abs(limit_amps)}",
-                        f"setting single sweep current range on {channel}",
-                    )
-                else:
-                    self._send_cmd_checked(
-                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON",
-                        f"enabling current autorange during single sweep on {channel}",
-                    )
+                self._apply_current_measure_range(channel)
 
             def _build_linear_segment(
                 start_value: float,
@@ -982,7 +973,7 @@ end
                 self._source_levels[active_channel] = float(block_stop)
                 self._source_levels[inactive_channel] = 0.0
 
-            _configure_fast_measurement(active_channel, sweep_current_limit)
+            _configure_fast_measurement(active_channel)
             self._send_cmd_checked(
                 f"{inactive_channel}.source.output = {inactive_channel}.OUTPUT_OFF",
                 f"turning off inactive {inactive_channel}",
@@ -1086,7 +1077,7 @@ end
                 self.abort_sweep()
                 raise InterruptedError("Sweep aborted by user.")
 
-            def _configure_fast_measurement(channel: str, limit_amps: float | None) -> None:
+            def _configure_fast_measurement(channel: str) -> None:
                 self._send_cmd_checked(
                     f"{channel}.measure.nplc = {float(nplc)}",
                     f"setting fast sweep NPLC on {channel}",
@@ -1103,20 +1094,7 @@ end
                     f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF",
                     f"disabling autozero on {channel}",
                 )
-                if limit_amps is not None and limit_amps > 0:
-                    self._send_cmd_checked(
-                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_OFF",
-                        f"disabling current autorange during sweep on {channel}",
-                    )
-                    self._send_cmd_checked(
-                        f"{channel}.measure.rangei = {abs(limit_amps)}",
-                        f"setting sweep current range on {channel}",
-                    )
-                else:
-                    self._send_cmd_checked(
-                        f"{channel}.measure.autorangei = {channel}.AUTORANGE_ON",
-                        f"enabling current autorange during sweep on {channel}",
-                    )
+                self._apply_current_measure_range(channel)
 
             def _build_linear_segment(
                 start_value: float,
@@ -1399,8 +1377,8 @@ end
                     secondary_stop if secondary_mode_token == 1 else secondary_level
                 )
 
-            _configure_fast_measurement(primary_channel, sweep_current_limit)
-            _configure_fast_measurement(secondary_channel, secondary_current_limit)
+            _configure_fast_measurement(primary_channel)
+            _configure_fast_measurement(secondary_channel)
 
             if ramp_up and abs(start_v) > 0:
                 ramp_up_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)

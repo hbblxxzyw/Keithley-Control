@@ -220,8 +220,7 @@ class AbstractSMU(ABC):
                 is linearly spaced between start_v and stop_v.
             delay: Source-to-measure delay in seconds for each step.
             nplc: Integration time in PLC (power-line cycles) per measurement.
-            current_limit: Optional current compliance/range hint in A for
-                configuring a fixed current measurement range during the sweep.
+            current_limit: Optional source current compliance limit in A.
             measurement_items: Requested quantities for the primary sweep
                 channel. If voltage or resistance is requested, implementations
                 may return measured voltages in addition to currents.
@@ -240,8 +239,8 @@ class AbstractSMU(ABC):
                 secondary_mode == "linear".
             secondary_stop_v: Optional secondary sweep stop in V when
                 secondary_mode == "linear".
-            secondary_current_limit: Optional current compliance/range hint in
-                A for the secondary channel during the synchronized block.
+            secondary_current_limit: Optional source current compliance limit
+                in A for the secondary channel during the synchronized block.
 
         Yields:
             Tuples

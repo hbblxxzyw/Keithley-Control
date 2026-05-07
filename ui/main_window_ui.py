@@ -842,8 +842,12 @@ class MainWindowUI(QMainWindow):
         stop_spin.setDecimals(4)
         form.addRow("Stop:", stop_spin)
 
-        step_display = QLabel("0.000 V")
-        step_display.setStyleSheet("color: #202124; padding: 2px;")
+        step_display = QDoubleSpinBox()
+        step_display.setRange(0.0, 2000.0)
+        step_display.setDecimals(6)
+        step_display.setSingleStep(0.1)
+        step_display.setSuffix(" V")
+        step_display.setKeyboardTracking(False)
         form.addRow("Step:", step_display)
 
         limit_spin = ScientificDoubleSpinBox()
