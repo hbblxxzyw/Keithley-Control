@@ -32,6 +32,16 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_widget import PreviewGraphWidget, MeasurementGraphWidget
+from ui.pulse_config_dialog import (
+    PulseConfigDialog,
+    default_pulse_config,
+    normalize_pulse_config,
+)
+
+
+KEITHLEY_DELAY_MAX_S = 100000.0
+KEITHLEY_DELAY_STEP_S = 500e-9
+KEITHLEY_DELAY_DECIMALS = 9
 
 
 class MultiSelectComboBox(QComboBox):
@@ -195,6 +205,40 @@ class ScientificDoubleSpinBox(QDoubleSpinBox):
         return (QValidator.State.Acceptable, text, pos)
 
 
+class AdaptiveDelaySpinBox(QDoubleSpinBox):
+    """Delay spinbox that stores ns-scale precision but keeps common values tidy."""
+
+    display_decimals = 4
+
+    def textFromValue(self, value: float) -> str:
+        value = float(value)
+        rounded_display_value = round(value, self.display_decimals)
+        precision_tolerance = 0.5 * (10 ** -self.decimals())
+        if abs(value - rounded_display_value) <= precision_tolerance:
+            return f"{rounded_display_value:.{self.display_decimals}f}"
+        text = f"{value:.{self.decimals()}f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    def valueFromText(self, text: str) -> float:
+        cleaned = text.replace(self.suffix(), "").strip()
+        if not cleaned:
+            return self.minimum()
+        return float(cleaned)
+
+    def validate(self, text: str, pos: int) -> tuple[QValidator.State, str, int]:
+        cleaned = text.replace(self.suffix(), "").strip()
+        if not cleaned or cleaned in {"-", "+", ".", "-.", "+.", "E", "e"}:
+            return (QValidator.State.Intermediate, text, pos)
+        try:
+            float(cleaned)
+        except ValueError:
+            partial_markers = ("e", "e+", "e-", "E", "E+", "E-")
+            if cleaned.endswith(partial_markers):
+                return (QValidator.State.Intermediate, text, pos)
+            return (QValidator.State.Invalid, text, pos)
+        return (QValidator.State.Acceptable, text, pos)
+
+
 class MainWindowUI(QMainWindow):
     """
     Main application window with a top-level QTabWidget:
@@ -263,14 +307,22 @@ class MainWindowUI(QMainWindow):
         return str(combo.currentText() or "").strip().lower() if combo else "fixed"
 
     def _apply_channel_mode_state(self, smu_index: int) -> None:
-        is_sweep = self._mode_text(smu_index) == "sweep"
-        getattr(self, f"level_spin_smu{smu_index}").setEnabled(not is_sweep)
+        mode = self._mode_text(smu_index)
+        is_sweep = mode == "sweep"
+        is_pulse = mode == "pulse"
+        getattr(self, f"level_spin_smu{smu_index}").setEnabled(
+            not is_sweep and not is_pulse
+        )
         getattr(self, f"start_spin_smu{smu_index}").setEnabled(is_sweep)
         getattr(self, f"stop_spin_smu{smu_index}").setEnabled(is_sweep)
         getattr(self, f"step_display_smu{smu_index}").setEnabled(is_sweep)
         dual_check = getattr(self, f"dual_sweep_check_smu{smu_index}")
         dual_check.setEnabled(is_sweep)
         dual_check.setVisible(is_sweep)
+        pulse_button = getattr(self, f"pulse_config_btn_smu{smu_index}")
+        pulse_button.setEnabled(is_pulse)
+        pulse_button.setVisible(is_pulse)
+        self._refresh_pulse_button_text(smu_index)
 
     def _apply_ramp_visibility(self, smu_index: int) -> None:
         function_text = str(
@@ -357,6 +409,7 @@ class MainWindowUI(QMainWindow):
                     getattr(self, f"level_spin_smu{i}"),
                     getattr(self, f"start_spin_smu{i}"),
                     getattr(self, f"stop_spin_smu{i}"),
+                    getattr(self, f"pulse_config_btn_smu{i}"),
                     getattr(self, f"limit_spin_smu{i}"),
                     getattr(self, f"measure_combo_smu{i}"),
                     getattr(self, f"measure_range_combo_smu{i}"),
@@ -402,6 +455,7 @@ class MainWindowUI(QMainWindow):
             "start": float(getattr(self, f"start_spin_smu{smu_index}").value()),
             "stop": float(getattr(self, f"stop_spin_smu{smu_index}").value()),
             "limit": float(getattr(self, f"limit_spin_smu{smu_index}").value()),
+            "pulse": normalize_pulse_config(self._pulse_configs.get(smu_index)),
             "measure": {
                 "items": list(
                     getattr(self, f"measure_combo_smu{smu_index}").selected_items()
@@ -472,6 +526,10 @@ class MainWindowUI(QMainWindow):
                 getattr(self, f"limit_spin_smu{smu_index}").setValue(
                     float(smu_cfg.get("limit", getattr(self, f"limit_spin_smu{smu_index}").value()))
                 )
+                self._pulse_configs[smu_index] = normalize_pulse_config(
+                    smu_cfg.get("pulse")
+                )
+                self._refresh_pulse_button_text(smu_index)
                 measure_cfg = smu_cfg.get("measure", {})
                 getattr(self, f"measure_combo_smu{smu_index}").set_selected_items(
                     list(measure_cfg.get("items", ["Voltage", "Current"]))
@@ -535,6 +593,10 @@ class MainWindowUI(QMainWindow):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.instrument_model = "2636B"
+        self._pulse_configs = {
+            1: default_pulse_config(),
+            2: default_pulse_config(),
+        }
         self.setWindowTitle("Keithley 2636 SMU Control")
         self.setMinimumSize(1000, 700)
         self.resize(1200, 800)
@@ -686,21 +748,21 @@ class MainWindowUI(QMainWindow):
         self.measure_window_label = QLabel("20.0 ms")
         common_layout.addRow("Measure Window:", self.measure_window_label)
 
-        self.src_meas_delay_spin = QDoubleSpinBox()
-        self.src_meas_delay_spin.setRange(0.0, 3600.0)
+        self.src_meas_delay_spin = AdaptiveDelaySpinBox()
+        self.src_meas_delay_spin.setRange(0.0, KEITHLEY_DELAY_MAX_S)
         self.src_meas_delay_spin.setValue(0.0)
         self.src_meas_delay_spin.setSuffix(" s")
-        self.src_meas_delay_spin.setDecimals(2)
-        self.src_meas_delay_spin.setSingleStep(0.01)
+        self.src_meas_delay_spin.setDecimals(KEITHLEY_DELAY_DECIMALS)
+        self.src_meas_delay_spin.setSingleStep(KEITHLEY_DELAY_STEP_S)
         common_layout.addRow("Src to Meas Delay:", self.src_meas_delay_spin)
         self.src_meas_delay_spin.valueChanged.connect(self.emit_config_changed)
 
-        self.step_sweep_delay_spin = QDoubleSpinBox()
-        self.step_sweep_delay_spin.setRange(0.0, 3600.0)
+        self.step_sweep_delay_spin = AdaptiveDelaySpinBox()
+        self.step_sweep_delay_spin.setRange(0.0, KEITHLEY_DELAY_MAX_S)
         self.step_sweep_delay_spin.setValue(0.0)
         self.step_sweep_delay_spin.setSuffix(" s")
-        self.step_sweep_delay_spin.setDecimals(2)
-        self.step_sweep_delay_spin.setSingleStep(0.01)
+        self.step_sweep_delay_spin.setDecimals(KEITHLEY_DELAY_DECIMALS)
+        self.step_sweep_delay_spin.setSingleStep(KEITHLEY_DELAY_STEP_S)
         common_layout.addRow("Step to Sweep Delay:", self.step_sweep_delay_spin)
         self.step_sweep_delay_spin.valueChanged.connect(self.emit_config_changed)
 
@@ -776,7 +838,7 @@ class MainWindowUI(QMainWindow):
         form.addRow("Function:", function_combo)
 
         mode_combo = QComboBox()
-        mode_combo.addItems(["Fixed", "Sweep"])
+        mode_combo.addItems(["Fixed", "Sweep", "Pulse"])
         form.addRow("Mode:", mode_combo)
 
         dual_sweep_check = QCheckBox("Dual Sweep")
@@ -850,6 +912,10 @@ class MainWindowUI(QMainWindow):
         step_display.setKeyboardTracking(False)
         form.addRow("Step:", step_display)
 
+        pulse_config_btn = QPushButton("Configure Pulse...")
+        pulse_config_btn.setVisible(False)
+        form.addRow("", pulse_config_btn)
+
         limit_spin = ScientificDoubleSpinBox()
         limit_spin.setRange(1e-9, 1.515)
         limit_spin.setDecimals(9)
@@ -876,6 +942,7 @@ class MainWindowUI(QMainWindow):
         setattr(self, f"start_spin_smu{smu_index}", start_spin)
         setattr(self, f"stop_spin_smu{smu_index}", stop_spin)
         setattr(self, f"step_display_smu{smu_index}", step_display)
+        setattr(self, f"pulse_config_btn_smu{smu_index}", pulse_config_btn)
         setattr(self, f"limit_spin_smu{smu_index}", limit_spin)
         setattr(self, f"measure_popup_smu{smu_index}", measure_popup)
         setattr(self, f"measure_combo_smu{smu_index}", measure_popup.measure_combo)
@@ -900,6 +967,9 @@ class MainWindowUI(QMainWindow):
             getattr(self, f"level_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"start_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"stop_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
+            getattr(self, f"pulse_config_btn_smu{i}").clicked.connect(
+                lambda checked=False, smu_index=i: self.open_pulse_config_dialog(smu_index)
+            )
             getattr(self, f"limit_spin_smu{i}").valueChanged.connect(self.emit_config_changed)
             getattr(self, f"measure_popup_smu{i}").selection_changed.connect(self.emit_config_changed)
             getattr(self, f"function_combo_smu{i}").currentTextChanged.connect(self._refresh_dynamic_ui_state)
@@ -913,6 +983,29 @@ class MainWindowUI(QMainWindow):
         self.smu2_enable_group.toggled.connect(self._refresh_dynamic_ui_state)
         self.stepper_selector.currentTextChanged.connect(self._refresh_dynamic_ui_state)
         self._refresh_dynamic_ui_state()
+
+    def _refresh_pulse_button_text(self, smu_index: int) -> None:
+        button = getattr(self, f"pulse_config_btn_smu{smu_index}", None)
+        if button is None:
+            return
+        config = normalize_pulse_config(self._pulse_configs.get(smu_index))
+        count = len(config["combinations"])
+        suffix = "combination" if count == 1 else "combinations"
+        button.setText(f"Configure Pulse... ({count} {suffix})")
+
+    def open_pulse_config_dialog(self, smu_index: int) -> None:
+        current = normalize_pulse_config(self._pulse_configs.get(smu_index))
+        dialog = PulseConfigDialog(
+            current,
+            parent=self,
+            title=f"SMU {smu_index} Pulse Configuration",
+        )
+        if dialog.exec() != PulseConfigDialog.Accepted:
+            return
+
+        self._pulse_configs[smu_index] = normalize_pulse_config(dialog.config())
+        self._refresh_pulse_button_text(smu_index)
+        self.emit_config_changed()
 
     def _build_graph_tab(self) -> None:
         layout = QVBoxLayout(self.graph_tab)

@@ -8,13 +8,21 @@ chunked data streaming.
 """
 
 import math
+import os
 import re
 import time
 from collections.abc import Callable, Generator
 
-import pyvisa
+try:
+    import pyvisa
+except ImportError as exc:
+    pyvisa = None
+    _PYVISA_IMPORT_ERROR = exc
+else:
+    _PYVISA_IMPORT_ERROR = None
 
 from core.instrument_base import AbstractSMU
+from core.pulse_sequence import PulseEvent
 
 
 class RealKeithley2636(AbstractSMU):
@@ -33,10 +41,11 @@ class RealKeithley2636(AbstractSMU):
     MEASURE_EVERY_N_POINTS = 8
     DEFAULT_RESOURCE_ENCODING = "latin-1"
     DUAL_SYNC_SCRIPT_NAME = "oai_dualsync"
+    PULSE_SCRIPT_NAME = "oai_pulse"
 
     def __init__(self, debug: bool = False) -> None:
         self.debug = debug
-        self._rm = pyvisa.ResourceManager()
+        self._rm = None if debug else self._create_resource_manager()
         self._resource = None
         self._current_limits: dict[str, float] = {}
         self._source_levels: dict[str, float] = {"smua": 0.0, "smub": 0.0}
@@ -45,6 +54,52 @@ class RealKeithley2636(AbstractSMU):
         self._measure_state: dict[str, dict[str, object]] = {}
         self._instrument_model = "2636B" if debug else None
         self._dual_sync_script_loaded = bool(debug)
+        self._pulse_script_loaded = bool(debug)
+
+    @staticmethod
+    def _create_resource_manager():
+        if pyvisa is None:
+            raise RuntimeError(
+                "PyVISA is not installed. Install pyvisa, or run with the dummy "
+                "instrument for GUI development."
+            ) from _PYVISA_IMPORT_ERROR
+
+        requested_backend = os.environ.get("KEITHLEY_VISA_BACKEND", "").strip()
+        if requested_backend:
+            return pyvisa.ResourceManager(requested_backend)
+
+        errors: list[str] = []
+        for backend in (None, "@py"):
+            try:
+                if backend is None:
+                    return pyvisa.ResourceManager()
+                return pyvisa.ResourceManager(backend)
+            except Exception as exc:
+                label = "default" if backend is None else backend
+                errors.append(f"{label}: {exc}")
+
+        details = "; ".join(errors)
+        raise RuntimeError(
+            "Could not load a VISA backend. Install NI-VISA, install pyvisa-py, "
+            "or run with the dummy instrument for GUI development. "
+            f"Tried {details}"
+        )
+
+    @classmethod
+    def visa_available(cls) -> tuple[bool, str | None]:
+        """Return whether PyVISA can load a usable VISA backend on this machine."""
+        try:
+            rm = cls._create_resource_manager()
+        except Exception as exc:
+            return False, str(exc)
+
+        close = getattr(rm, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return True, None
 
     def _send_cmd(self, cmd: str) -> None:
         if self.debug:
@@ -131,6 +186,53 @@ class RealKeithley2636(AbstractSMU):
         # FIX: Print numbered TSP script lines to help map Keithley error line numbers.
         for line_no, line_text in enumerate(script_body.strip("\r\n").splitlines(), start=1):
             print(f"[TSP {line_no:03d}] {line_text}")
+
+    def _load_tsp_script_with_functions(
+        self,
+        script_name: str,
+        script_body: str,
+        function_names: list[str],
+    ) -> None:
+        if self.debug:
+            print(f"[DEBUG LOADSCRIPT] {script_name}")
+            print(script_body.strip())
+            return
+        if self._resource is None:
+            raise RuntimeError("Instrument not connected; call connect() first.")
+
+        self._send_cmd("*CLS")
+        self._send_cmd("errorqueue.clear()")
+        normalized_body = script_body.strip("\r\n")
+        full_script = f"loadandrunscript {script_name}\n{normalized_body}\nendscript"
+        self._resource.write(full_script)
+        errors = self.dump_errors()
+        if errors:
+            self._debug_dump_script_lines(script_body)
+            error_lines = "\n".join(
+                f"  {index}. {entry}" for index, entry in enumerate(errors, start=1)
+            )
+            raise RuntimeError(
+                f"Failed to load TSP script '{script_name}'.\nError queue:\n{error_lines}"
+            )
+
+        expr = ", ".join(f"type({name})" for name in function_names)
+        type_reply = self._query_cmd_checked(
+            f"print({expr})",
+            f"verifying TSP globals for '{script_name}'",
+        )
+        type_tokens = [
+            token.strip().lower()
+            for token in re.split(r"[\s,]+", type_reply)
+            if token
+        ]
+        if len(type_tokens) < len(function_names) or any(
+            token != "function" for token in type_tokens[: len(function_names)]
+        ):
+            details = ", ".join(
+                f"{name}={type_tokens[index] if index < len(type_tokens) else '<missing>'}"
+                for index, name in enumerate(function_names)
+            )
+            raise RuntimeError(f"Loaded TSP pulse functions are not callable: {details}")
 
     def _error_queue_count(self) -> int:
         if self.debug:
@@ -472,10 +574,15 @@ end
             return repr(float(value))
         return str(value)
 
+    def _format_tsp_table(self, values: list[float]) -> str:
+        return "{" + ", ".join(self._format_tsp_value(float(value)) for value in values) + "}"
+
     def connect(self, resource_str: str) -> bool:
         if self.debug:
             print(f"[DEBUG] Virtual connection OK: {resource_str}")
             return True
+        if self._rm is None:
+            return False
         try:
             self._resource = self._rm.open_resource(resource_str)
             self._resource.timeout = self.DEFAULT_TIMEOUT_MS
@@ -488,6 +595,7 @@ end
 
             self._ensure_ascii_stream_format()
             self._dual_sync_script_loaded = False
+            self._pulse_script_loaded = False
             return True
         except Exception as exc:
             print(f"Connection error: {exc}")
@@ -502,6 +610,7 @@ end
             self._resource = None
         self._instrument_model = None
         self._dual_sync_script_loaded = False
+        self._pulse_script_loaded = False
 
     def get_model(self) -> str | None:
         if self.debug:
@@ -524,6 +633,8 @@ end
         return None
 
     def find_resource_address(self, preferred_serial: str | None = None) -> str | None:
+        if self._rm is None:
+            return None
         try:
             resources = list(self._rm.list_resources())
         except Exception:
@@ -728,6 +839,260 @@ end
             out[item] = float(value)
         state["last"] = dict(out)
         return out
+
+    def _build_pulse_script(self) -> str:
+        return """
+function _pulse_pb(c)
+    c.nvbuffer1.clear()
+    c.nvbuffer1.clearcache()
+    c.nvbuffer1.appendmode = 1
+    c.nvbuffer1.collectsourcevalues = 1
+    c.nvbuffer1.collecttimestamps = 1
+end
+
+function configure_pulse(cn, on, smode, levels, widths, periods, n, lim)
+    local c = _G[cn]
+    local o = _G[on]
+    if c == nil then
+        error("Unknown pulse SMU: " .. tostring(cn))
+    end
+
+    c.abort()
+    if o ~= nil then
+        o.abort()
+        o.source.output = o.OUTPUT_OFF
+        o.trigger.source.action = o.DISABLE
+        o.trigger.measure.action = o.DISABLE
+    end
+    trigger.timer[2].reset()
+    trigger.timer[3].reset()
+
+    _pulse_pb(c)
+
+    if smode == 1 then
+        c.source.func = c.OUTPUT_DCAMPS
+        if lim ~= nil and lim > 0 then
+            c.source.limitv = lim
+        end
+        c.source.leveli = 0
+        c.trigger.source.listi(levels)
+        c.trigger.measure.v(c.nvbuffer1)
+    else
+        c.source.func = c.OUTPUT_DCVOLTS
+        if lim ~= nil and lim > 0 then
+            c.source.limiti = lim
+        end
+        c.source.levelv = 0
+        c.trigger.source.listv(levels)
+        c.trigger.measure.i(c.nvbuffer1)
+    end
+
+    c.source.delay = 0
+    c.measure.delay = 0
+    c.trigger.source.action = c.ENABLE
+    c.trigger.measure.action = c.ENABLE
+    c.trigger.count = n
+    c.trigger.arm.count = 1
+    c.trigger.arm.stimulus = 0
+
+    c.trigger.measure.stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
+
+    trigger.timer[3].delaylist = widths
+    trigger.timer[3].passthrough = false
+    trigger.timer[3].count = 1
+
+    if n > 1 then
+        trigger.timer[2].delaylist = periods
+        trigger.timer[2].count = n - 1
+        trigger.timer[2].passthrough = true
+        trigger.timer[2].stimulus = c.trigger.SWEEPING_EVENT_ID
+        c.trigger.source.stimulus = trigger.timer[2].EVENT_ID
+        trigger.timer[3].stimulus = trigger.timer[2].EVENT_ID
+    else
+        c.trigger.source.stimulus = 0
+        trigger.timer[3].stimulus = c.trigger.ARMED_EVENT_ID
+    end
+
+    c.trigger.endpulse.action = c.SOURCE_IDLE
+    c.trigger.endpulse.stimulus = trigger.timer[3].EVENT_ID
+    c.trigger.endsweep.action = c.SOURCE_IDLE
+
+    c.source.output = c.OUTPUT_ON
+    c.trigger.initiate()
+end
+
+function wait_pulse_done()
+    waitcomplete()
+end
+        """
+
+    def _ensure_pulse_script_loaded(self) -> None:
+        if self._pulse_script_loaded:
+            return
+        if self.debug:
+            self._pulse_script_loaded = True
+            return
+        self._load_tsp_script_with_functions(
+            self.PULSE_SCRIPT_NAME,
+            self._build_pulse_script(),
+            ["configure_pulse", "wait_pulse_done"],
+        )
+        self._pulse_script_loaded = True
+
+    def run_pulse_sequence(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        events: list[PulseEvent],
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        if not events:
+            return
+
+        self._ensure_ascii_stream_format()
+        self._ensure_pulse_script_loaded()
+        self._raise_if_error_queue("preparing pulse sequence")
+
+        try:
+            self._clear_error_state()
+            active_channel = smu_channel
+            inactive_channel = "smub" if smu_channel == "smua" else "smua"
+            normalized_mode = str(source_mode or "voltage").strip().lower()
+            source_mode_token = 1 if normalized_mode == "current" else 0
+            limit = source_limit
+            if limit is None:
+                limit = self._source_limits.get(active_channel)
+
+            levels = [float(event.level) for event in events]
+            widths = [float(event.width_s) for event in events]
+            periods = [float(event.period_s) for event in events]
+            total_points = len(events)
+
+            def _abort_if_requested() -> None:
+                if stop_checker is None or not stop_checker():
+                    return
+                self.abort_sweep()
+                raise InterruptedError("Pulse run aborted by user.")
+
+            def _debug_pulse_data() -> tuple[
+                list[float],
+                list[float] | None,
+                list[float] | None,
+                list[float],
+            ]:
+                timestamps: list[float] = []
+                elapsed_s = 0.0
+                for event in events:
+                    timestamps.append(elapsed_s)
+                    elapsed_s += max(float(event.period_s), 0.0)
+                if source_mode_token == 1:
+                    currents = list(levels)
+                    voltages = [
+                        0.05 + level * 1.0e5 + index * 1e-4
+                        for index, level in enumerate(levels)
+                    ]
+                else:
+                    voltages = list(levels)
+                    currents = [
+                        1.23e-6 + level * 1e-7 + index * 1e-9
+                        for index, level in enumerate(levels)
+                    ]
+                return levels, currents, voltages, timestamps
+
+            if self.debug:
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                yield _debug_pulse_data()
+                self._source_levels[active_channel] = 0.0
+                self._source_levels[inactive_channel] = 0.0
+                return
+
+            self._send_cmd_checked(
+                "configure_pulse("
+                f"{self._format_tsp_value(active_channel)}, "
+                f"{self._format_tsp_value(inactive_channel)}, "
+                f"{source_mode_token}, "
+                f"{self._format_tsp_table(levels)}, "
+                f"{self._format_tsp_table(widths)}, "
+                f"{self._format_tsp_table(periods)}, "
+                f"{total_points}, "
+                f"{self._format_tsp_value(limit)})",
+                f"starting pulse sequence on {active_channel}",
+            )
+
+            old_n = 0
+            while old_n < total_points:
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                _abort_if_requested()
+                self._raise_if_error_queue(f"polling pulse progress on {active_channel}")
+                current_n = int(
+                    float(
+                        self._query_cmd_checked(
+                            f"print({active_channel}.nvbuffer1.n)",
+                            f"reading pulse buffer count on {active_channel}",
+                        )
+                    )
+                )
+                current_n = min(current_n, total_points)
+                if current_n <= old_n:
+                    continue
+                if (
+                    current_n < total_points
+                    and current_n - old_n < self.MIN_CHUNK_POINTS
+                ):
+                    continue
+
+                pull_start = old_n + 1
+                while pull_start <= current_n:
+                    _abort_if_requested()
+                    pull_end = min(
+                        pull_start + self.MAX_POINTS_PER_PRINTBUFFER - 1,
+                        current_n,
+                    )
+                    reply = self._query_cmd_checked(
+                        (
+                            f"printbuffer({pull_start}, {pull_end}, "
+                            f"{active_channel}.nvbuffer1.readings, "
+                            f"{active_channel}.nvbuffer1.timestamps)"
+                        ),
+                        f"reading pulse buffer rows {pull_start}-{pull_end}",
+                    )
+                    rows = self._reshape_printbuffer_rows(reply, 2)
+                    if rows:
+                        chunk_levels = levels[pull_start - 1 : pull_start - 1 + len(rows)]
+                        readings = [row[0] for row in rows]
+                        timestamps = [row[1] for row in rows]
+                        if source_mode_token == 1:
+                            currents = list(chunk_levels)
+                            voltages = readings
+                        else:
+                            currents = readings
+                            voltages = list(chunk_levels)
+                        yield (chunk_levels, currents, voltages, timestamps)
+                    pull_start = pull_end + 1
+
+                old_n = current_n
+
+            _abort_if_requested()
+            self._query_cmd_checked(
+                "wait_pulse_done() print(1)",
+                "waiting for pulse sequence completion",
+            )
+            self._source_levels[active_channel] = 0.0
+            self._source_levels[inactive_channel] = 0.0
+        except Exception:
+            self._recover_from_sweep_error()
+            raise
 
     def run_single_smu_sweep(
         self,

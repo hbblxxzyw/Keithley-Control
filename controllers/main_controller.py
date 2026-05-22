@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
 
 from core.instrument_base import AbstractSMU
+from core.pulse_sequence import PulseEvent, flatten_pulse_config, validate_pulse_events
 
 if TYPE_CHECKING:
     from ui.main_window_ui import MainWindowUI
@@ -425,6 +426,164 @@ class SweepWorker(QThread):
             self.finished_sweep.emit()
 
 
+class PulseWorker(QThread):
+    """Background worker for a single-SMU pulse sequence."""
+
+    data_ready = Signal(dict)
+    error_occurred = Signal(str)
+    finished_sweep = Signal()
+
+    def __init__(
+        self,
+        instrument: AbstractSMU,
+        params: Dict[str, Any],
+        parent: "MainWindowUI | None" = None,
+    ) -> None:
+        super().__init__(parent)
+        self.instrument = instrument
+        self.params = params
+
+    def run(self) -> None:
+        p = self.params
+        channel: str = p["channel"]
+        smu_name: str = p["smu_name"]
+        source_mode: str = p["source_mode"]
+        source_limit: float = p["source_limit"]
+        events: list[PulseEvent] = list(p["events"])
+        measure_cfg: dict[str, Any] = p["measure_cfg"]
+        nplc: float = p["nplc"]
+        started_at = time.monotonic()
+
+        def abort_if_requested() -> None:
+            if not self.isInterruptionRequested():
+                return
+            try:
+                self.instrument.abort_sweep()
+            except Exception:
+                pass
+            raise InterruptedError("Pulse run aborted by user.")
+
+        def build_values(
+            source_level: float,
+            current_value: float | None,
+            voltage_value: float | None,
+        ) -> dict[str, float]:
+            normalized_mode = str(source_mode).strip().lower()
+            values: dict[str, float] = {}
+            if normalized_mode == "current":
+                values["Current"] = float(
+                    current_value if current_value is not None else source_level
+                )
+                if voltage_value is not None:
+                    values["Voltage"] = float(voltage_value)
+            else:
+                values["Voltage"] = float(
+                    voltage_value if voltage_value is not None else source_level
+                )
+                if current_value is not None:
+                    values["Current"] = float(current_value)
+            if "Voltage" in values and "Current" in values:
+                current = values["Current"]
+                values["Resistance"] = (
+                    values["Voltage"] / current
+                    if abs(current) > 1e-15
+                    else float("inf")
+                )
+            return values
+
+        def build_payload(
+            sample_timestamp: float,
+            source_level: float,
+            values: dict[str, float],
+        ) -> dict[str, object]:
+            empty = {"source_v": 0.0, "values": {}}
+            active = {"source_v": float(source_level), "values": values}
+            return {
+                "time_s": float(sample_timestamp),
+                "sample_t_s": float(sample_timestamp),
+                "series_name": f"{smu_name} Pulse",
+                "primary_name": smu_name,
+                "stepper_name": "",
+                "smu1": active if channel == "smua" else empty,
+                "smu2": active if channel == "smub" else empty,
+            }
+
+        try:
+            abort_if_requested()
+            self.instrument.configure_measurement(
+                channel,
+                list(measure_cfg.get("items", [])),
+                str(measure_cfg.get("range", "Auto")),
+                str(measure_cfg.get("autozero", "Auto")),
+                nplc,
+            )
+            inactive_channel = "smub" if channel == "smua" else "smua"
+            self.instrument.set_output(inactive_channel, False)
+
+            for source_chunk, current_chunk, voltage_chunk, timestamp_chunk in (
+                self.instrument.run_pulse_sequence(
+                    channel,
+                    source_mode,
+                    events,
+                    source_limit,
+                    list(measure_cfg.get("items", [])),
+                    abort_if_requested,
+                )
+            ):
+                abort_if_requested()
+                for index, source_level in enumerate(source_chunk):
+                    current_value = (
+                        None
+                        if current_chunk is None or index >= len(current_chunk)
+                        else float(current_chunk[index])
+                    )
+                    voltage_value = (
+                        None
+                        if voltage_chunk is None or index >= len(voltage_chunk)
+                        else float(voltage_chunk[index])
+                    )
+                    sample_timestamp = (
+                        float(timestamp_chunk[index])
+                        if index < len(timestamp_chunk)
+                        else time.monotonic() - started_at
+                    )
+                    values = build_values(
+                        float(source_level),
+                        current_value,
+                        voltage_value,
+                    )
+                    self.data_ready.emit(
+                        build_payload(sample_timestamp, float(source_level), values)
+                    )
+        except InterruptedError:
+            print("Pulse run aborted by user.")
+        except Exception as exc:
+            print(f"Pulse run failed: {exc}")
+            try:
+                error_queue = list(self.instrument.dump_errors())
+            except Exception as error_exc:
+                print(f"Failed to read instrument error queue: {error_exc}")
+            else:
+                if error_queue:
+                    print("Instrument error queue:")
+                    for index, error_entry in enumerate(error_queue, start=1):
+                        print(f"  {index}. {error_entry}")
+                else:
+                    print("Instrument error queue is empty.")
+            traceback.print_exc()
+            self.error_occurred.emit(str(exc))
+        finally:
+            try:
+                self.instrument.set_output("smua", False)
+            except Exception:
+                pass
+            try:
+                self.instrument.set_output("smub", False)
+            except Exception:
+                pass
+            self.finished_sweep.emit()
+
+
 class MainController:
     """
     Connects UI actions to the instrument: connect, run sweep, update preview
@@ -774,6 +933,7 @@ class MainController:
         nplc = float(self.ui.nplc_spin.value())
         window_ms = nplc * 20.0  # 1 PLC at 50 Hz = 20 ms
         self.ui.measure_window_label.setText(f"{window_ms:.1f} ms")
+        settings = self.ui.collect_settings()
 
         # ----- Read SMU 1 form -----
         mode1 = str(self.ui.mode_combo_smu1.currentText() or "").strip().lower()
@@ -854,11 +1014,16 @@ class MainController:
                 pts2_base = sweep_points
                 pri_dual = dual2
                 pri_mode = mode2
-            else:
+            elif mode1 == "sweep":
                 pts1_base = sweep_points
                 pts2_base = 0
                 pri_dual = dual1
                 pri_mode = mode1
+            else:
+                pts1_base = 0
+                pts2_base = 0
+                pri_dual = False
+                pri_mode = mode1 if enabled1 else mode2
             step_dual = False
             step_mode = "fixed"
 
@@ -927,6 +1092,9 @@ class MainController:
         if func1 == "Voltage":
             if mode1 == "fixed":
                 self.ui.smu1_source_label.setText(f"Bias Level: {level1:.4g} V")
+            elif mode1 == "pulse":
+                pulse_count = len(settings["smu1"].get("pulse", {}).get("combinations", []))
+                self.ui.smu1_source_label.setText(f"Pulse: {pulse_count} combinations")
             else:
                 step1_str = format_step(step1_val, func1)
                 self.ui.smu1_source_label.setText(
@@ -936,6 +1104,9 @@ class MainController:
         else:
             if mode1 == "fixed":
                 self.ui.smu1_source_label.setText(f"Bias Level: {level1:.4g} A")
+            elif mode1 == "pulse":
+                pulse_count = len(settings["smu1"].get("pulse", {}).get("combinations", []))
+                self.ui.smu1_source_label.setText(f"Pulse: {pulse_count} combinations")
             else:
                 step1_str = format_step(step1_val, func1 or "Current")
                 self.ui.smu1_source_label.setText(
@@ -944,7 +1115,7 @@ class MainController:
             self.ui.smu1_limit_label.setText(f"{limit1:.4g} V")
 
         # Ramp summary (only meaningful in Voltage mode)
-        if func1 == "Voltage":
+        if func1 == "Voltage" and mode1 == "sweep":
             ramp_parts: list[str] = []
             if self.ui.ramp_up_check_smu1.isChecked():
                 ramp_parts.append("Up")
@@ -970,6 +1141,9 @@ class MainController:
         if func2 == "Voltage":
             if mode2 == "fixed":
                 self.ui.smu2_source_label.setText(f"Bias Level: {level2:.4g} V")
+            elif mode2 == "pulse":
+                pulse_count = len(settings["smu2"].get("pulse", {}).get("combinations", []))
+                self.ui.smu2_source_label.setText(f"Pulse: {pulse_count} combinations")
             else:
                 step2_str = format_step(step2_val, func2)
                 self.ui.smu2_source_label.setText(
@@ -979,6 +1153,9 @@ class MainController:
         else:
             if mode2 == "fixed":
                 self.ui.smu2_source_label.setText(f"Bias Level: {level2:.4g} A")
+            elif mode2 == "pulse":
+                pulse_count = len(settings["smu2"].get("pulse", {}).get("combinations", []))
+                self.ui.smu2_source_label.setText(f"Pulse: {pulse_count} combinations")
             else:
                 step2_str = format_step(step2_val, func2 or "Current")
                 self.ui.smu2_source_label.setText(
@@ -987,7 +1164,7 @@ class MainController:
             self.ui.smu2_limit_label.setText(f"{limit2:.4g} V")
 
         # Ramp summary (only meaningful in Voltage mode)
-        if func2 == "Voltage":
+        if func2 == "Voltage" and mode2 == "sweep":
             ramp_parts2: list[str] = []
             if self.ui.ramp_up_check_smu2.isChecked():
                 ramp_parts2.append("Up")
@@ -1057,6 +1234,12 @@ class MainController:
                 "step_sweep_delay": step_sweep_delay,
                 "repeat": repeats,
             }
+        elif mode1 == "pulse":
+            smu1_cfg = {
+                "mode": "pulse",
+                "pulse": settings["smu1"].get("pulse", {}),
+                "repeat": repeats,
+            }
         else:
             smu1_cfg = {
                 "mode": "sweep",
@@ -1076,6 +1259,12 @@ class MainController:
                 "level": level2,
                 "src_meas_delay": src_meas_delay,
                 "step_sweep_delay": step_sweep_delay,
+                "repeat": repeats,
+            }
+        elif mode2 == "pulse":
+            smu2_cfg = {
+                "mode": "pulse",
+                "pulse": settings["smu2"].get("pulse", {}),
                 "repeat": repeats,
             }
         else:
@@ -1134,6 +1323,63 @@ class MainController:
             for channel, enabled in (("smua", smu1_enabled), ("smub", smu2_enabled))
             if enabled
         ]
+        pulse_channels = [
+            (name, channel, cfg)
+            for name, channel, enabled, cfg in (
+                ("SMU 1", "smua", smu1_enabled, settings["smu1"]),
+                ("SMU 2", "smub", smu2_enabled, settings["smu2"]),
+            )
+            if enabled and str(cfg.get("mode", "")).strip().lower() == "pulse"
+        ]
+        if pulse_channels:
+            if len(pulse_channels) != 1 or len(enabled_channels) != 1:
+                QMessageBox.information(
+                    self.ui,
+                    "Pulse Mode",
+                    (
+                        "Single-SMU Pulse execution is supported now. "
+                        "Dual-SMU Pulse and Pulse mixed with Fixed/Sweep are not supported yet."
+                    ),
+                )
+                self.ui.run_btn.setEnabled(True)
+                self.ui.abort_btn.setEnabled(False)
+                return
+
+            smu_name, channel, pulse_cfg = pulse_channels[0]
+            repeat = int(settings.get("common", {}).get("repeat", 1))
+            try:
+                events = flatten_pulse_config(pulse_cfg.get("pulse", {}), repeat=repeat)
+                validate_pulse_events(events)
+            except Exception as exc:
+                QMessageBox.warning(self.ui, "Invalid Pulse Sequence", str(exc))
+                self.ui.run_btn.setEnabled(True)
+                self.ui.abort_btn.setEnabled(False)
+                return
+
+            self.ui.graph_plot_placeholder.clear_plot()
+            self.ui.data_table.setRowCount(0)
+            self.ui.tab_widget.setCurrentWidget(self.ui.graph_tab)
+            self._autoscale_after_first_point = True
+            QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
+
+            params: Dict[str, Any] = {
+                "smu_name": smu_name,
+                "channel": channel,
+                "source_mode": str(pulse_cfg.get("function", "Voltage")).strip().lower(),
+                "source_limit": float(pulse_cfg.get("limit", 0.0)),
+                "events": events,
+                "measure_cfg": settings["smu1"]["measure"]
+                if channel == "smua"
+                else settings["smu2"]["measure"],
+                "nplc": float(self.ui.nplc_spin.value()),
+            }
+
+            self.worker = PulseWorker(self.instrument, params, parent=self.ui)
+            self.worker.data_ready.connect(self.handle_new_data_point)
+            self.worker.error_occurred.connect(self.handle_sweep_error)
+            self.worker.finished_sweep.connect(self.handle_sweep_finished)
+            self.worker.start()
+            return
         if not enabled_channels:
             QMessageBox.warning(
                 self.ui,

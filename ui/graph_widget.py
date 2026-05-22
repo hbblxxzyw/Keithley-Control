@@ -9,6 +9,111 @@ from PySide6.QtWidgets import QToolTip
 from pyqtgraph import PlotDataItem
 
 
+def _normalized_pulse_items(items: object) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _append_pulse_level(
+    times: list[float],
+    values: list[float],
+    current_time: float,
+    level: float,
+    duration_s: float,
+) -> float:
+    duration_s = max(0.0, float(duration_s))
+    if values[-1] != level:
+        times.append(current_time)
+        values.append(level)
+    current_time += duration_s
+    times.append(current_time)
+    values.append(level)
+    if values[-1] != 0.0:
+        times.append(current_time)
+        values.append(0.0)
+    return current_time
+
+
+def _append_pulse_items(
+    times: list[float],
+    values: list[float],
+    items: list[dict],
+    current_time: float,
+) -> float:
+    for pulse in _normalized_pulse_items(items):
+        pulse_type = str(pulse.get("type", "single")).strip().lower()
+        if pulse_type == "train":
+            current_time = _append_pulse_items(
+                times,
+                values,
+                _normalized_pulse_items(pulse.get("items", [])),
+                current_time,
+            )
+            interval_after = max(0.0, float(pulse.get("interval_after_s", 0.0)))
+            current_time += interval_after
+            times.append(current_time)
+            values.append(0.0)
+            continue
+
+        magnitude = float(pulse.get("magnitude", 0.0))
+        duration_s = float(pulse.get("duration_s", 0.0))
+        current_time = _append_pulse_level(
+            times, values, current_time, magnitude, duration_s
+        )
+
+        if pulse_type == "paired":
+            pair_interval_s = max(0.0, float(pulse.get("interval_s", 0.0)))
+            current_time += pair_interval_s
+            times.append(current_time)
+            values.append(0.0)
+            current_time = _append_pulse_level(
+                times, values, current_time, magnitude, duration_s
+            )
+
+        interval_after = max(0.0, float(pulse.get("interval_after_s", 0.0)))
+        current_time += interval_after
+        times.append(current_time)
+        values.append(0.0)
+
+    return current_time
+
+
+def build_full_pulse_waveform(pulse_config: dict | None, repeat: int = 1) -> tuple[list[float], list[float]]:
+    times: list[float] = [0.0]
+    values: list[float] = [0.0]
+    if not isinstance(pulse_config, dict):
+        return [0.0, 1.0], [0.0, 0.0]
+
+    combinations = pulse_config.get("combinations", [])
+    if not isinstance(combinations, list) or not combinations:
+        return [0.0, 1.0], [0.0, 0.0]
+
+    current_time = 0.0
+    for _ in range(max(1, int(repeat))):
+        for combination in combinations:
+            if not isinstance(combination, dict):
+                continue
+            combination_repeat = max(1, int(combination.get("repeat", 1)))
+            for _ in range(combination_repeat):
+                current_time = _append_pulse_items(
+                    times,
+                    values,
+                    _normalized_pulse_items(combination.get("items", [])),
+                    current_time,
+                )
+                interval_after = max(
+                    0.0, float(combination.get("interval_after_s", 0.0))
+                )
+                current_time += interval_after
+                times.append(current_time)
+                values.append(0.0)
+
+    if current_time <= 0.0:
+        return [0.0, 1.0], [0.0, 0.0]
+    return times, values
+
+
 class PlainAxisItem(pg.AxisItem):
     """Axis item that always renders plain values without SI scaling."""
 
@@ -103,12 +208,45 @@ class PreviewGraphWidget(pg.GraphicsLayoutWidget):
         Config format:
         - Fixed: {"mode": "fixed", "level": float}
         - Sweep: {"mode": "sweep", "start": float, "stop": float, "points": int, "dual": bool}
+        - Pulse: {"mode": "pulse", "pulse": dict, "repeat": int}
         """
+        duration = max(
+            float(duration),
+            self._config_duration(smu1_cfg),
+            self._config_duration(smu2_cfg),
+        )
         time = np.linspace(0, duration, num_points)
-        y1 = self._build_amplitude(time, smu1_cfg, duration)
-        y2 = self._build_amplitude(time, smu2_cfg, duration)
-        self.line_smu1.setData(time.tolist(), y1.tolist())
-        self.line_smu2.setData(time.tolist(), y2.tolist())
+        x1, y1 = self._build_preview_data(time, smu1_cfg, duration)
+        x2, y2 = self._build_preview_data(time, smu2_cfg, duration)
+        self.line_smu1.setData(x1, y1)
+        self.line_smu2.setData(x2, y2)
+
+    def _build_preview_data(
+        self, time: np.ndarray, cfg: dict, duration: float
+    ) -> tuple[list[float], list[float]]:
+        if cfg.get("mode") == "pulse":
+            pulse_times, pulse_values = build_full_pulse_waveform(
+                cfg.get("pulse"),
+                repeat=int(cfg.get("repeat", 1)),
+            )
+            if pulse_times and pulse_times[-1] < duration:
+                pulse_times = list(pulse_times) + [duration]
+                pulse_values = list(pulse_values) + [pulse_values[-1]]
+            return pulse_times, pulse_values
+
+        return (
+            time.tolist(),
+            self._build_amplitude(time, cfg, duration).tolist(),
+        )
+
+    def _config_duration(self, cfg: dict) -> float:
+        if cfg.get("mode") != "pulse":
+            return 0.0
+        times, _ = build_full_pulse_waveform(
+            cfg.get("pulse"),
+            repeat=int(cfg.get("repeat", 1)),
+        )
+        return max(times) if times else 0.0
 
     def _build_amplitude(
         self, time: np.ndarray, cfg: dict, duration: float
@@ -136,6 +274,14 @@ class PreviewGraphWidget(pg.GraphicsLayoutWidget):
                 (time / step_duration).astype(int), 0, n_steps - 1
             )
             return voltages[indices]
+        if mode == "pulse":
+            pulse_times, pulse_values = build_full_pulse_waveform(
+                cfg.get("pulse"),
+                repeat=int(cfg.get("repeat", 1)),
+            )
+            indices = np.searchsorted(pulse_times, time, side="right") - 1
+            indices = np.clip(indices, 0, len(pulse_values) - 1)
+            return np.asarray([pulse_values[index] for index in indices], dtype=float)
         return np.zeros_like(time)
 
 

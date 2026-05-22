@@ -135,6 +135,38 @@ class AbstractSMU(ABC):
         return None
 
     @abstractmethod
+    def run_pulse_sequence(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        events: list[object],
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """
+        Run a single-SMU pulse sequence using the instrument trigger model.
+
+        Yields chunks of (
+            source_levels,
+            current_values,
+            voltage_values,
+            timestamps,
+        ). Implementations may use source-only/minimal measurements, but
+        should return enough data for the GUI table when practical.
+        """
+        pass
+
+    @abstractmethod
     def run_single_smu_sweep(
         self,
         smu_channel: str,

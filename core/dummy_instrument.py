@@ -8,6 +8,7 @@ measurements return fake data.
 from collections.abc import Callable, Generator
 
 from core.instrument_base import AbstractSMU
+from core.pulse_sequence import PulseEvent
 
 
 class DummyKeithley2636(AbstractSMU):
@@ -29,7 +30,11 @@ class DummyKeithley2636(AbstractSMU):
 
     def get_model(self) -> str:
         """Return the simulated instrument model."""
-        return "2636B"
+        return "2636B Simulator"
+
+    def find_resource_address(self, preferred_serial: str | None = None) -> str:
+        """Return a fake resource address so GUI auto-connect works offline."""
+        return "DUMMY::KEITHLEY2636::INSTR"
 
     def set_output(self, smu_channel: str, state: bool) -> None:
         """No-op."""
@@ -77,6 +82,57 @@ class DummyKeithley2636(AbstractSMU):
     def abort_sweep(self) -> None:
         """Dummy driver has no active instrument sweep to abort."""
         return None
+
+    def run_pulse_sequence(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        events: list[PulseEvent],
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """Yield deterministic fake pulse readings for offline GUI testing."""
+        if not events:
+            return
+        if stop_checker is not None and stop_checker():
+            raise InterruptedError("Pulse run aborted by user.")
+
+        normalized_mode = str(source_mode or "voltage").strip().lower()
+        levels = [float(event.level) for event in events]
+        timestamps: list[float] = []
+        elapsed_s = 0.0
+        for event in events:
+            timestamps.append(elapsed_s)
+            elapsed_s += max(float(event.width_s), 0.0) + max(
+                float(event.interval_after_s), 0.0
+            )
+
+        if normalized_mode == "current":
+            currents = list(levels)
+            voltages = [
+                0.05 + level * 1.0e5 + index * 1e-4
+                for index, level in enumerate(levels)
+            ]
+            self._source_levels[smu_channel] = 0.0
+        else:
+            voltages = list(levels)
+            currents = [
+                1.23e-6 + level * 1e-7 + index * 1e-9
+                for index, level in enumerate(levels)
+            ]
+            self._source_levels[smu_channel] = 0.0
+
+        yield (levels, currents, voltages, timestamps)
 
     def run_iv_sweep(
         self,
