@@ -349,8 +349,14 @@ class MainWindowUI(QMainWindow):
             for idx, mode, enabled in ((1, mode1, enabled1), (2, mode2, enabled2))
             if enabled and mode == "sweep"
         ]
+        pulse_modes = [
+            idx
+            for idx, mode, enabled in ((1, mode1, enabled1), (2, mode2, enabled2))
+            if enabled and mode == "pulse"
+        ]
 
         self.sweep_points_spin.setEnabled(bool(sweep_modes))
+        self.pulse_sample_interval_spin.setEnabled(bool(pulse_modes))
 
         current_stepper = str(self.stepper_selector.currentText() or "").strip()
         allowed_stepper_options = ["None"]
@@ -386,6 +392,7 @@ class MainWindowUI(QMainWindow):
             self.nplc_spin,
             self.src_meas_delay_spin,
             self.step_sweep_delay_spin,
+            self.pulse_sample_interval_spin,
             self.stepper_selector,
             self.sweep_points_spin,
             self.stepper_points_spin,
@@ -426,6 +433,7 @@ class MainWindowUI(QMainWindow):
                 "nplc": float(self.nplc_spin.value()),
                 "src_meas_delay": float(self.src_meas_delay_spin.value()),
                 "step_sweep_delay": float(self.step_sweep_delay_spin.value()),
+                "pulse_sample_interval": float(self.pulse_sample_interval_spin.value()),
                 "stepper": str(self.stepper_selector.currentText() or "").strip(),
                 "sweep_points": int(self.sweep_points_spin.value()),
                 "stepper_points": int(self.stepper_points_spin.value()),
@@ -561,6 +569,14 @@ class MainWindowUI(QMainWindow):
             )
             self.step_sweep_delay_spin.setValue(
                 float(common_cfg.get("step_sweep_delay", self.step_sweep_delay_spin.value()))
+            )
+            self.pulse_sample_interval_spin.setValue(
+                float(
+                    common_cfg.get(
+                        "pulse_sample_interval",
+                        self.pulse_sample_interval_spin.value(),
+                    )
+                )
             )
             self.sweep_points_spin.setValue(
                 int(common_cfg.get("sweep_points", self.sweep_points_spin.value()))
@@ -765,6 +781,15 @@ class MainWindowUI(QMainWindow):
         self.step_sweep_delay_spin.setSingleStep(KEITHLEY_DELAY_STEP_S)
         common_layout.addRow("Step to Sweep Delay:", self.step_sweep_delay_spin)
         self.step_sweep_delay_spin.valueChanged.connect(self.emit_config_changed)
+
+        self.pulse_sample_interval_spin = AdaptiveDelaySpinBox()
+        self.pulse_sample_interval_spin.setRange(0.0, KEITHLEY_DELAY_MAX_S)
+        self.pulse_sample_interval_spin.setValue(0.001)
+        self.pulse_sample_interval_spin.setSuffix(" s")
+        self.pulse_sample_interval_spin.setDecimals(KEITHLEY_DELAY_DECIMALS)
+        self.pulse_sample_interval_spin.setSingleStep(0.0001)
+        common_layout.addRow("Pulse Sample Interval:", self.pulse_sample_interval_spin)
+        self.pulse_sample_interval_spin.valueChanged.connect(self.emit_config_changed)
 
         self.stepper_selector = QComboBox()
         self.stepper_selector.addItems(["None", "SMU 2", "SMU 1"])
@@ -1015,6 +1040,21 @@ class MainWindowUI(QMainWindow):
         self.clear_plot_btn = QPushButton("Clear Plot")
         self.autoscale_btn = QPushButton("Autoscale")
         self.export_image_btn = QPushButton("Export to Image")
+        self.x_axis_combo = QComboBox()
+        self.y_axis_combo = QComboBox()
+        axis_options = [
+            "Time",
+            "SMU1 Voltage",
+            "SMU1 Current",
+            "SMU1 Resistance",
+            "SMU2 Voltage",
+            "SMU2 Current",
+            "SMU2 Resistance",
+        ]
+        self.x_axis_combo.addItems(axis_options)
+        self.y_axis_combo.addItems(axis_options)
+        self.x_axis_combo.setCurrentText("SMU1 Voltage")
+        self.y_axis_combo.setCurrentText("SMU1 Current")
         self.graph_linear_btn = QPushButton("Linear")
         self.graph_log_btn = QPushButton("Log |I|")
         self.graph_linear_btn.setCheckable(True)
@@ -1023,6 +1063,10 @@ class MainWindowUI(QMainWindow):
         graph_toolbar.addWidget(self.clear_plot_btn)
         graph_toolbar.addWidget(self.autoscale_btn)
         graph_toolbar.addWidget(self.export_image_btn)
+        graph_toolbar.addWidget(QLabel("X Axis:"))
+        graph_toolbar.addWidget(self.x_axis_combo)
+        graph_toolbar.addWidget(QLabel("Y Axis:"))
+        graph_toolbar.addWidget(self.y_axis_combo)
         graph_toolbar.addWidget(self.graph_linear_btn)
         graph_toolbar.addWidget(self.graph_log_btn)
         graph_toolbar.addStretch()

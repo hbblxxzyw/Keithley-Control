@@ -68,6 +68,16 @@ class AbstractSMU(ABC):
         pass
 
     @abstractmethod
+    def set_current_source(
+        self, smu_channel: str, current: float, voltage_limit: float
+    ) -> None:
+        """
+        Set the specified channel to constant current source mode and set
+        current and voltage compliance limit.
+        """
+        pass
+
+    @abstractmethod
     def measure_current(self, smu_channel: str) -> float:
         """
         Perform a single current measurement on the specified channel.
@@ -163,6 +173,44 @@ class AbstractSMU(ABC):
             timestamps,
         ). Implementations may use source-only/minimal measurements, but
         should return enough data for the GUI table when practical.
+        """
+        pass
+
+    @abstractmethod
+    def run_pulse_timeline(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        timeline: list[object],
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        bias_config: dict | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """
+        Run a full time-resolved pulse list sweep.
+
+        Yields chunks of (
+            active_source_levels,
+            active_current_values,
+            active_voltage_values,
+            bias_source_levels,
+            bias_current_values,
+            bias_voltage_values,
+            timestamps,
+        ).
         """
         pass
 

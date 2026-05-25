@@ -287,11 +287,20 @@ class PreviewGraphWidget(pg.GraphicsLayoutWidget):
 
 class MeasurementGraphWidget(pg.PlotWidget):
     """
-    Plot widget for the Graph tab: real I-V measurement data.
+    Plot widget for the Graph tab.
 
-    Uses a single plot with separate series for SMU 1 and SMU 2.
-    All curves share the same sweep-voltage X axis.
+    Stores raw measurement payloads so axis changes can redraw existing data.
     """
+
+    AXIS_LABELS = [
+        "Time",
+        "SMU1 Voltage",
+        "SMU1 Current",
+        "SMU1 Resistance",
+        "SMU2 Voltage",
+        "SMU2 Current",
+        "SMU2 Resistance",
+    ]
 
     def __init__(self, parent=None, **kwargs) -> None:
         super().__init__(parent=parent, **kwargs)
@@ -302,9 +311,12 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self.addLegend()
 
         self._series: dict[tuple[str, str], PlotDataItem] = {}
-        self._data: dict[tuple[str, str], tuple[list[float], list[float]]] = {}
+        self._data: dict[tuple[str, str], tuple[list[float], list[float], list[dict]]] = {}
+        self._payloads: list[dict] = []
         self._color_index: dict[str, int] = {"SMU 1": 0, "SMU 2": 0}
         self._display_mode = "linear"
+        self._x_axis = "SMU1 Voltage"
+        self._y_axis = "SMU1 Current"
         self._hover_distance_px = 10.0
         self._hover_proxy = pg.SignalProxy(
             self.scene().sigMouseMoved,
@@ -315,11 +327,70 @@ class MeasurementGraphWidget(pg.PlotWidget):
             "SMU 1": ["#1565c0", "#00838f", "#3949ab", "#0277bd"],
             "SMU 2": ["#c62828", "#ef6c00", "#ad1457", "#6d4c41"],
         }
+        self._update_axis_labels()
 
     def append_data_point(
         self, smu_name: str, x_val: float, y_val: float, series_name: str
     ) -> None:
         """Append one point to the given SMU series on the shared plot."""
+        payload = {
+            "series_name": series_name,
+            "smu1": {"values": {}},
+            "smu2": {"values": {}},
+        }
+        smu_key = "smu1" if smu_name == "SMU 1" else "smu2"
+        payload[smu_key]["values"] = {"Voltage": float(x_val), "Current": float(y_val)}
+        self.append_payload(payload)
+
+    def append_payload(self, payload: dict) -> None:
+        """Append one raw measurement payload and redraw the selected axes."""
+        self._payloads.append(payload)
+        self._append_payload_for_current_axes(payload)
+
+    def set_axes(self, x_axis: str, y_axis: str) -> None:
+        """Change graph axes and redraw already-acquired payloads."""
+        if x_axis in self.AXIS_LABELS:
+            self._x_axis = x_axis
+        if y_axis in self.AXIS_LABELS:
+            self._y_axis = y_axis
+        self._update_axis_labels()
+        self._redraw_from_payloads()
+
+    def _redraw_from_payloads(self) -> None:
+        self._clear_curves_only()
+        for payload in self._payloads:
+            self._append_payload_for_current_axes(payload)
+
+    def _append_payload_for_current_axes(self, payload: dict) -> None:
+        x_val = self._axis_value(payload, self._x_axis)
+        y_val = self._axis_value(payload, self._y_axis)
+        if x_val is None or y_val is None:
+            return
+        if not np.isfinite(float(x_val)) or not np.isfinite(float(y_val)):
+            return
+        if self._y_axis.startswith("SMU1"):
+            smu_name = "SMU 1"
+        elif self._y_axis.startswith("SMU2"):
+            smu_name = "SMU 2"
+        else:
+            smu_name = "Time"
+        series_name = str(payload.get("series_name", "Measurement"))
+        self._append_plot_point(
+            smu_name,
+            float(x_val),
+            float(y_val),
+            series_name,
+            payload,
+        )
+
+    def _append_plot_point(
+        self,
+        smu_name: str,
+        x_val: float,
+        y_val: float,
+        series_name: str,
+        payload: dict,
+    ) -> None:
         key = (smu_name, series_name)
         if key not in self._series:
             palette = self._palette.get(smu_name, ["#424242"])
@@ -339,33 +410,79 @@ class MeasurementGraphWidget(pg.PlotWidget):
                 symbolPen=pg.mkPen(color, width=1),
             )
             self._series[key] = curve
-            self._data[key] = ([], [])
+            self._data[key] = ([], [], [])
             curve.setData([], [])
-        xs, ys = self._data[key]
+        xs, ys, payloads = self._data[key]
         xs.append(x_val)
         ys.append(y_val)
+        payloads.append(payload)
         self._refresh_curve(key)
 
     def set_display_mode(self, mode: str) -> None:
-        """Switch between linear current display and log absolute-current display."""
+        """Switch between linear display and log absolute-value display."""
         normalized = str(mode or "linear").strip().lower()
         self._display_mode = "log" if normalized == "log" else "linear"
         self.setLogMode(x=False, y=self._display_mode == "log")
-        if self._display_mode == "log":
-            self.setLabel("left", "|Current| (A)")
-        else:
-            self.setLabel("left", "Current (A)")
+        self._update_axis_labels()
         for key in self._series:
             self._refresh_curve(key)
 
     def _refresh_curve(self, key: tuple[str, str]) -> None:
-        xs, ys = self._data[key]
+        xs, ys, _payloads = self._data[key]
         if self._display_mode == "log":
             log_ys = [abs(float(y)) for y in ys if abs(float(y)) > 0.0]
             log_xs = [x for x, y in zip(xs, ys) if abs(float(y)) > 0.0]
             self._series[key].setData(log_xs, log_ys)
             return
         self._series[key].setData(xs, ys)
+
+    def _update_axis_labels(self) -> None:
+        self.setLabel("bottom", self._axis_label(self._x_axis))
+        y_label = self._axis_label(self._y_axis)
+        if self._display_mode == "log":
+            y_label = f"|{y_label}|"
+        self.setLabel("left", y_label)
+
+    def _axis_label(self, axis_name: str) -> str:
+        if axis_name == "Time":
+            return "Time (s)"
+        quantity = axis_name.split(" ", 1)[1] if " " in axis_name else axis_name
+        unit = {
+            "Voltage": "V",
+            "Current": "A",
+            "Resistance": "Ohm",
+        }.get(quantity, "")
+        return f"{axis_name} ({unit})" if unit else axis_name
+
+    def _axis_value(self, payload: dict, axis_name: str) -> float | None:
+        if axis_name == "Time":
+            try:
+                return float(payload.get("time_s", payload.get("sample_t_s", 0.0)))
+            except (TypeError, ValueError):
+                return None
+
+        axis_map = {
+            "SMU1 Voltage": ("smu1", "Voltage"),
+            "SMU1 Current": ("smu1", "Current"),
+            "SMU1 Resistance": ("smu1", "Resistance"),
+            "SMU2 Voltage": ("smu2", "Voltage"),
+            "SMU2 Current": ("smu2", "Current"),
+            "SMU2 Resistance": ("smu2", "Resistance"),
+        }
+        if axis_name not in axis_map:
+            return None
+        smu_key, value_key = axis_map[axis_name]
+        smu_payload = payload.get(smu_key, {})
+        values = smu_payload.get("values", {}) if isinstance(smu_payload, dict) else {}
+        value = values.get(value_key)
+        if value is None and value_key == "Voltage":
+            value = smu_payload.get("source_v", smu_payload.get("source_level"))
+        elif value is None and value_key == "Current":
+            value = smu_payload.get("source_i")
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _handle_mouse_moved(self, event) -> None:
         scene_pos = event[0]
@@ -385,8 +502,8 @@ class MeasurementGraphWidget(pg.PlotWidget):
             global_pos,
             (
                 f"{smu_name} | {series_name}\n"
-                f"X: {self._format_axis_value(x_val)} V\n"
-                f"Y: {self._format_axis_value(y_val)} A"
+                f"X: {self._format_axis_value(x_val)}\n"
+                f"Y: {self._format_axis_value(y_val)}"
             ),
             self,
         )
@@ -431,6 +548,11 @@ class MeasurementGraphWidget(pg.PlotWidget):
 
     def clear_plot(self) -> None:
         """Clear all series and legend entries."""
+        self._payloads.clear()
+        self._clear_curves_only()
+        self.autoscale()
+
+    def _clear_curves_only(self) -> None:
         for curve in list(self._series.values()):
             self.removeItem(curve)
         legend = self.plotItem.legend
@@ -439,7 +561,6 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self._series.clear()
         self._data.clear()
         self._color_index = {"SMU 1": 0, "SMU 2": 0}
-        self.autoscale()
 
     def autoscale(self) -> None:
         """Autoscale both axes to the currently plotted data."""

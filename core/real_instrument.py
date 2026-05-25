@@ -22,7 +22,7 @@ else:
     _PYVISA_IMPORT_ERROR = None
 
 from core.instrument_base import AbstractSMU
-from core.pulse_sequence import PulseEvent
+from core.pulse_sequence import PulseEvent, PulseTimelinePoint
 
 
 class RealKeithley2636(AbstractSMU):
@@ -690,6 +690,32 @@ end
         if current_limit > 0:
             self._current_limits[smu_channel] = float(current_limit)
 
+    def set_current_source(
+        self, smu_channel: str, current: float, voltage_limit: float
+    ) -> None:
+        if self._source_modes.get(smu_channel) != "current":
+            self._send_cmd_checked(
+                f"{smu_channel}.source.func = {smu_channel}.OUTPUT_DCAMPS",
+                f"configuring {smu_channel} current source mode",
+            )
+            self._source_modes[smu_channel] = "current"
+
+        last_limit = self._source_limits.get(smu_channel)
+        if last_limit is None or abs(last_limit - float(voltage_limit)) > 1e-15:
+            self._send_cmd_checked(
+                f"{smu_channel}.source.limitv = {voltage_limit}",
+                f"setting {smu_channel} voltage limit",
+            )
+            self._source_limits[smu_channel] = float(voltage_limit)
+
+        last_level = self._source_levels.get(smu_channel)
+        if last_level is None or abs(last_level - float(current)) > 1e-15:
+            self._send_cmd_checked(
+                f"{smu_channel}.source.leveli = {current}",
+                f"setting {smu_channel} source current",
+            )
+        self._source_levels[smu_channel] = float(current)
+
     def measure_current(self, smu_channel: str) -> float:
         reply = self._query_cmd_checked(
             f"print({smu_channel}.measure.i())",
@@ -848,6 +874,11 @@ function _pulse_pb(c)
     c.nvbuffer1.appendmode = 1
     c.nvbuffer1.collectsourcevalues = 1
     c.nvbuffer1.collecttimestamps = 1
+    c.nvbuffer2.clear()
+    c.nvbuffer2.clearcache()
+    c.nvbuffer2.appendmode = 1
+    c.nvbuffer2.collectsourcevalues = 1
+    c.nvbuffer2.collecttimestamps = 1
 end
 
 function configure_pulse(cn, on, smode, levels, widths, periods, n, lim)
@@ -924,6 +955,111 @@ end
 function wait_pulse_done()
     waitcomplete()
 end
+
+function configure_pulse_timeline(cn, on, smode, levels, delays, n, lim, bmode, blev, blim, measure_bias)
+    local c = _G[cn]
+    local b = nil
+    if on ~= nil then
+        b = _G[on]
+    end
+    if c == nil then
+        error("Unknown pulse SMU: " .. tostring(cn))
+    end
+
+    c.abort()
+    if b ~= nil then
+        b.abort()
+    end
+    trigger.blender[1].reset()
+    trigger.timer[2].reset()
+
+    _pulse_pb(c)
+    if b ~= nil then
+        _pulse_pb(b)
+    end
+
+    if smode == 1 then
+        c.source.func = c.OUTPUT_DCAMPS
+        if lim ~= nil and lim > 0 then
+            c.source.limitv = lim
+        end
+        c.source.leveli = 0
+        c.trigger.source.listi(levels)
+    else
+        c.source.func = c.OUTPUT_DCVOLTS
+        if lim ~= nil and lim > 0 then
+            c.source.limiti = lim
+        end
+        c.source.levelv = 0
+        c.trigger.source.listv(levels)
+    end
+
+    c.source.delay = 0
+    c.measure.delay = 0
+    c.trigger.source.action = c.ENABLE
+    c.trigger.measure.iv(c.nvbuffer1, c.nvbuffer2)
+    c.trigger.measure.action = c.ENABLE
+    c.trigger.count = n
+    c.trigger.arm.count = 1
+    c.trigger.arm.stimulus = 0
+    c.trigger.measure.stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
+
+    if n > 1 then
+        trigger.timer[2].delaylist = delays
+        trigger.timer[2].count = n - 1
+        trigger.timer[2].passthrough = false
+        trigger.timer[2].stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
+
+        trigger.blender[1].orenable = true
+        trigger.blender[1].stimulus[1] = c.trigger.ARMED_EVENT_ID
+        trigger.blender[1].stimulus[2] = trigger.timer[2].EVENT_ID
+        c.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+    else
+        c.trigger.source.stimulus = 0
+    end
+
+    c.trigger.endpulse.action = c.SOURCE_HOLD
+    c.trigger.endpulse.stimulus = c.trigger.MEASURE_COMPLETE_EVENT_ID
+    c.trigger.endsweep.action = c.SOURCE_IDLE
+
+    if b ~= nil then
+        if bmode == 1 then
+            b.source.func = b.OUTPUT_DCAMPS
+            if blim ~= nil and blim > 0 then
+                b.source.limitv = blim
+            end
+            b.source.leveli = blev
+        else
+            b.source.func = b.OUTPUT_DCVOLTS
+            if blim ~= nil and blim > 0 then
+                b.source.limiti = blim
+            end
+            b.source.levelv = blev
+        end
+        b.source.delay = 0
+        b.measure.delay = 0
+        b.trigger.source.action = b.DISABLE
+        if measure_bias ~= 0 then
+            b.trigger.measure.iv(b.nvbuffer1, b.nvbuffer2)
+            b.trigger.measure.action = b.ENABLE
+            b.trigger.count = n
+            b.trigger.arm.count = 1
+            b.trigger.arm.stimulus = 0
+            b.trigger.measure.stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
+            b.trigger.endpulse.action = b.SOURCE_HOLD
+            b.trigger.endsweep.action = b.SOURCE_HOLD
+        else
+            b.trigger.measure.action = b.DISABLE
+        end
+        b.source.output = b.OUTPUT_ON
+    end
+
+    if b ~= nil and measure_bias ~= 0 then
+        b.trigger.initiate()
+    end
+    c.source.output = c.OUTPUT_ON
+    c.trigger.initiate()
+end
         """
 
     def _ensure_pulse_script_loaded(self) -> None:
@@ -935,7 +1071,7 @@ end
         self._load_tsp_script_with_functions(
             self.PULSE_SCRIPT_NAME,
             self._build_pulse_script(),
-            ["configure_pulse", "wait_pulse_done"],
+            ["configure_pulse", "configure_pulse_timeline", "wait_pulse_done"],
         )
         self._pulse_script_loaded = True
 
@@ -1090,6 +1226,244 @@ end
             )
             self._source_levels[active_channel] = 0.0
             self._source_levels[inactive_channel] = 0.0
+        except Exception:
+            self._recover_from_sweep_error()
+            raise
+
+    def run_pulse_timeline(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        timeline: list[PulseTimelinePoint],
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        bias_config: dict | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        if not timeline:
+            return
+
+        self._ensure_ascii_stream_format()
+        self._ensure_pulse_script_loaded()
+        self._raise_if_error_queue("preparing pulse timeline")
+
+        try:
+            self._clear_error_state()
+            active_channel = smu_channel
+            normalized_mode = str(source_mode or "voltage").strip().lower()
+            source_mode_token = 1 if normalized_mode == "current" else 0
+            limit = source_limit
+            if limit is None:
+                limit = self._source_limits.get(active_channel)
+
+            levels = [float(point.source_level) for point in timeline]
+            delays = [float(point.dwell_to_next_s) for point in timeline[:-1]]
+            timestamps = [float(point.time_s) for point in timeline]
+            total_points = len(timeline)
+
+            bias_channel: str | None = None
+            bias_mode_token = 0
+            bias_level = 0.0
+            bias_limit: float | None = None
+            measure_bias = False
+            if isinstance(bias_config, dict):
+                bias_channel = str(bias_config.get("channel", "")).strip() or None
+                bias_mode = str(bias_config.get("source_mode", "voltage")).strip().lower()
+                bias_mode_token = 1 if bias_mode == "current" else 0
+                bias_level = float(bias_config.get("level", 0.0))
+                bias_limit = float(bias_config.get("limit", 0.0))
+                measure_bias = bias_channel is not None
+
+            self._source_modes[active_channel] = normalized_mode
+            if bias_channel is not None:
+                self._source_modes[bias_channel] = (
+                    "current" if bias_mode_token == 1 else "voltage"
+                )
+
+            def _abort_if_requested() -> None:
+                if stop_checker is None or not stop_checker():
+                    return
+                self.abort_sweep()
+                raise InterruptedError("Pulse run aborted by user.")
+
+            def _debug_pulse_timeline_data() -> tuple[
+                list[float],
+                list[float] | None,
+                list[float] | None,
+                list[float] | None,
+                list[float] | None,
+                list[float] | None,
+                list[float],
+            ]:
+                if source_mode_token == 1:
+                    active_currents = list(levels)
+                    active_voltages = [
+                        0.05 + level * 1.0e5 + index * 1e-4
+                        for index, level in enumerate(levels)
+                    ]
+                else:
+                    active_voltages = list(levels)
+                    active_currents = [
+                        1.23e-6 + level * 1e-7 + index * 1e-9
+                        for index, level in enumerate(levels)
+                    ]
+
+                bias_sources: list[float] | None = None
+                bias_currents: list[float] | None = None
+                bias_voltages: list[float] | None = None
+                if bias_channel is not None:
+                    bias_sources = [bias_level] * len(levels)
+                    if bias_mode_token == 1:
+                        bias_currents = list(bias_sources)
+                        bias_voltages = [
+                            0.02 + bias_level * 1.0e5 + index * 5e-5
+                            for index in range(len(levels))
+                        ]
+                    else:
+                        bias_voltages = list(bias_sources)
+                        bias_currents = [
+                            8.9e-7 + bias_level * 8e-8 + index * 1e-9
+                            for index in range(len(levels))
+                        ]
+                return (
+                    levels,
+                    active_currents,
+                    active_voltages,
+                    bias_sources,
+                    bias_currents,
+                    bias_voltages,
+                    timestamps,
+                )
+
+            if self.debug:
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                yield _debug_pulse_timeline_data()
+                self._source_levels[active_channel] = 0.0
+                if bias_channel is not None:
+                    self._source_levels[bias_channel] = bias_level
+                return
+
+            self._send_cmd_checked(
+                "configure_pulse_timeline("
+                f"{self._format_tsp_value(active_channel)}, "
+                f"{self._format_tsp_value(bias_channel)}, "
+                f"{source_mode_token}, "
+                f"{self._format_tsp_table(levels)}, "
+                f"{self._format_tsp_table(delays)}, "
+                f"{total_points}, "
+                f"{self._format_tsp_value(limit)}, "
+                f"{bias_mode_token}, "
+                f"{self._format_tsp_value(bias_level)}, "
+                f"{self._format_tsp_value(bias_limit)}, "
+                f"{1 if measure_bias else 0})",
+                f"starting pulse timeline on {active_channel}",
+            )
+
+            old_n = 0
+            while old_n < total_points:
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                _abort_if_requested()
+                self._raise_if_error_queue(f"polling pulse timeline on {active_channel}")
+                active_n = int(
+                    float(
+                        self._query_cmd_checked(
+                            f"print({active_channel}.nvbuffer1.n)",
+                            f"reading pulse buffer count on {active_channel}",
+                        )
+                    )
+                )
+                current_n = min(active_n, total_points)
+                if measure_bias and bias_channel is not None:
+                    bias_n = int(
+                        float(
+                            self._query_cmd_checked(
+                                f"print({bias_channel}.nvbuffer1.n)",
+                                f"reading pulse buffer count on {bias_channel}",
+                            )
+                        )
+                    )
+                    current_n = min(current_n, bias_n)
+                if current_n <= old_n:
+                    continue
+                if (
+                    current_n < total_points
+                    and current_n - old_n < self.MIN_CHUNK_POINTS
+                ):
+                    continue
+
+                pull_start = old_n + 1
+                while pull_start <= current_n:
+                    _abort_if_requested()
+                    pull_end = min(
+                        pull_start + self.MAX_POINTS_PER_PRINTBUFFER - 1,
+                        current_n,
+                    )
+                    columns = [
+                        f"{active_channel}.nvbuffer1.readings",
+                        f"{active_channel}.nvbuffer1.timestamps",
+                        f"{active_channel}.nvbuffer2.readings",
+                    ]
+                    bias_current_index: int | None = None
+                    bias_voltage_index: int | None = None
+                    if measure_bias and bias_channel is not None:
+                        bias_current_index = len(columns)
+                        columns.append(f"{bias_channel}.nvbuffer1.readings")
+                        bias_voltage_index = len(columns)
+                        columns.append(f"{bias_channel}.nvbuffer2.readings")
+
+                    reply = self._query_cmd_checked(
+                        f"printbuffer({pull_start}, {pull_end}, {', '.join(columns)})",
+                        f"reading pulse timeline rows {pull_start}-{pull_end}",
+                    )
+                    rows = self._reshape_printbuffer_rows(reply, len(columns))
+                    if rows:
+                        chunk_levels = levels[pull_start - 1 : pull_start - 1 + len(rows)]
+                        active_currents = [row[0] for row in rows]
+                        active_timestamps = [row[1] for row in rows]
+                        active_voltages = [row[2] for row in rows]
+                        bias_sources = None
+                        bias_currents = None
+                        bias_voltages = None
+                        if (
+                            bias_current_index is not None
+                            and bias_voltage_index is not None
+                        ):
+                            bias_sources = [bias_level] * len(rows)
+                            bias_currents = [row[bias_current_index] for row in rows]
+                            bias_voltages = [row[bias_voltage_index] for row in rows]
+                        yield (
+                            chunk_levels,
+                            active_currents,
+                            active_voltages,
+                            bias_sources,
+                            bias_currents,
+                            bias_voltages,
+                            active_timestamps,
+                        )
+                    pull_start = pull_end + 1
+
+                old_n = current_n
+
+            _abort_if_requested()
+            self._query_cmd_checked(
+                "wait_pulse_done() print(1)",
+                "waiting for pulse timeline completion",
+            )
+            self._source_levels[active_channel] = 0.0
+            if bias_channel is not None:
+                self._source_levels[bias_channel] = bias_level
         except Exception:
             self._recover_from_sweep_error()
             raise

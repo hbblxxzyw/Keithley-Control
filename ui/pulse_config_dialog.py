@@ -10,9 +10,10 @@ from copy import deepcopy
 from typing import Any, Callable
 
 import pyqtgraph as pg
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -71,6 +72,36 @@ QListWidget::item:selected {
     font-weight: 600;
 }
 """
+
+
+def _install_enter_commit_filter(owner: QWidget, widgets: list[QWidget]) -> None:
+    """Let Enter commit field edits without accepting the parent dialog."""
+    commit_widgets = getattr(owner, "_enter_commit_widgets", None)
+    if commit_widgets is None:
+        commit_widgets = {}
+        setattr(owner, "_enter_commit_widgets", commit_widgets)
+    for widget in widgets:
+        widget.installEventFilter(owner)
+        commit_widgets[widget] = widget
+        if isinstance(widget, QAbstractSpinBox):
+            line_edit = widget.lineEdit()
+            line_edit.installEventFilter(owner)
+            commit_widgets[line_edit] = widget
+
+
+def _handle_enter_commit(owner: QWidget, watched: object, event: QEvent) -> bool:
+    if event.type() != QEvent.KeyPress:
+        return False
+    if event.key() not in (Qt.Key_Return, Qt.Key_Enter):  # type: ignore[attr-defined]
+        return False
+
+    commit_widget = getattr(owner, "_enter_commit_widgets", {}).get(watched)
+    if commit_widget is None:
+        return False
+    if isinstance(commit_widget, QAbstractSpinBox):
+        commit_widget.interpretText()
+    commit_widget.clearFocus()
+    return True
 
 
 def default_pulse_config() -> dict[str, Any]:
@@ -485,9 +516,23 @@ class PulseSequenceEditor(QWidget):
 
         self._rebuild_sequence()
         self._load_selected_pulse()
+        _install_enter_commit_filter(
+            self,
+            [
+                self.magnitude_spin,
+                self.duration_spin,
+                self.interval_spin,
+                self.interval_after_spin,
+            ],
+        )
 
     def items(self) -> list[dict[str, Any]]:
         return normalize_pulse_items(deepcopy(self._items), allow_train=self.allow_train)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if _handle_enter_commit(self, watched, event):
+            return True
+        return super().eventFilter(watched, event)
 
     def set_items(self, items: list[Any] | None) -> None:
         self._items = normalize_pulse_items(items, allow_train=self.allow_train)
@@ -897,9 +942,22 @@ class PulseConfigDialog(QDialog):
 
         self._rebuild_sequence()
         self._load_selected_combination()
+        _install_enter_commit_filter(
+            self,
+            [
+                self.name_edit,
+                self.interval_spin,
+                self.repeat_spin,
+            ],
+        )
 
     def config(self) -> dict[str, Any]:
         return normalize_pulse_config(deepcopy(self._config))
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if _handle_enter_commit(self, watched, event):
+            return True
+        return super().eventFilter(watched, event)
 
     def _selected_index(self) -> int:
         return int(self._config.get("selected_index", -1))

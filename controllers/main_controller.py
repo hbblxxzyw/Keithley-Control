@@ -13,7 +13,11 @@ from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
 
 from core.instrument_base import AbstractSMU
-from core.pulse_sequence import PulseEvent, flatten_pulse_config, validate_pulse_events
+from core.pulse_sequence import (
+    PulseTimelinePoint,
+    build_pulse_timeline,
+    flatten_pulse_config,
+)
 
 if TYPE_CHECKING:
     from ui.main_window_ui import MainWindowUI
@@ -427,7 +431,7 @@ class SweepWorker(QThread):
 
 
 class PulseWorker(QThread):
-    """Background worker for a single-SMU pulse sequence."""
+    """Background worker for a pulse timeline sequence."""
 
     data_ready = Signal(dict)
     error_occurred = Signal(str)
@@ -449,8 +453,17 @@ class PulseWorker(QThread):
         smu_name: str = p["smu_name"]
         source_mode: str = p["source_mode"]
         source_limit: float = p["source_limit"]
-        events: list[PulseEvent] = list(p["events"])
+        timeline: list[PulseTimelinePoint] = list(p["timeline"])
         measure_cfg: dict[str, Any] = p["measure_cfg"]
+        bias_cfg: dict[str, Any] | None = p.get("bias_config")
+        bias_measure_cfg: dict[str, Any] = p.get("bias_measure_cfg", {})
+        bias_name = str(bias_cfg.get("smu_name", "")) if isinstance(bias_cfg, dict) else ""
+        bias_channel = str(bias_cfg.get("channel", "")) if isinstance(bias_cfg, dict) else ""
+        bias_source_mode = (
+            str(bias_cfg.get("source_mode", "voltage")).strip().lower()
+            if isinstance(bias_cfg, dict)
+            else "voltage"
+        )
         nplc: float = p["nplc"]
         started_at = time.monotonic()
 
@@ -464,11 +477,12 @@ class PulseWorker(QThread):
             raise InterruptedError("Pulse run aborted by user.")
 
         def build_values(
+            mode: str,
             source_level: float,
             current_value: float | None,
             voltage_value: float | None,
         ) -> dict[str, float]:
-            normalized_mode = str(source_mode).strip().lower()
+            normalized_mode = str(mode).strip().lower()
             values: dict[str, float] = {}
             if normalized_mode == "current":
                 values["Current"] = float(
@@ -495,17 +509,32 @@ class PulseWorker(QThread):
             sample_timestamp: float,
             source_level: float,
             values: dict[str, float],
+            bias_source_level: float | None = None,
+            bias_values: dict[str, float] | None = None,
         ) -> dict[str, object]:
             empty = {"source_v": 0.0, "values": {}}
-            active = {"source_v": float(source_level), "values": values}
+            if str(source_mode).strip().lower() == "current":
+                active = {"source_v": 0.0, "source_i": float(source_level), "values": values}
+            else:
+                active = {"source_v": float(source_level), "values": values}
+            if bias_source_level is None:
+                bias = empty
+            elif bias_source_mode == "current":
+                bias = {
+                    "source_v": 0.0,
+                    "source_i": float(bias_source_level),
+                    "values": bias_values or {},
+                }
+            else:
+                bias = {"source_v": float(bias_source_level), "values": bias_values or {}}
             return {
                 "time_s": float(sample_timestamp),
                 "sample_t_s": float(sample_timestamp),
                 "series_name": f"{smu_name} Pulse",
                 "primary_name": smu_name,
-                "stepper_name": "",
-                "smu1": active if channel == "smua" else empty,
-                "smu2": active if channel == "smub" else empty,
+                "stepper_name": bias_name,
+                "smu1": active if channel == "smua" else (bias if bias_channel == "smua" else empty),
+                "smu2": active if channel == "smub" else (bias if bias_channel == "smub" else empty),
             }
 
         try:
@@ -517,16 +546,34 @@ class PulseWorker(QThread):
                 str(measure_cfg.get("autozero", "Auto")),
                 nplc,
             )
-            inactive_channel = "smub" if channel == "smua" else "smua"
-            self.instrument.set_output(inactive_channel, False)
+            if isinstance(bias_cfg, dict) and bias_channel:
+                self.instrument.configure_measurement(
+                    bias_channel,
+                    list(bias_measure_cfg.get("items", [])),
+                    str(bias_measure_cfg.get("range", "Auto")),
+                    str(bias_measure_cfg.get("autozero", "Auto")),
+                    nplc,
+                )
+            else:
+                inactive_channel = "smub" if channel == "smua" else "smua"
+                self.instrument.set_output(inactive_channel, False)
 
-            for source_chunk, current_chunk, voltage_chunk, timestamp_chunk in (
-                self.instrument.run_pulse_sequence(
+            for (
+                source_chunk,
+                current_chunk,
+                voltage_chunk,
+                bias_source_chunk,
+                bias_current_chunk,
+                bias_voltage_chunk,
+                timestamp_chunk,
+            ) in (
+                self.instrument.run_pulse_timeline(
                     channel,
                     source_mode,
-                    events,
+                    timeline,
                     source_limit,
                     list(measure_cfg.get("items", [])),
+                    bias_cfg,
                     abort_if_requested,
                 )
             ):
@@ -548,12 +595,42 @@ class PulseWorker(QThread):
                         else time.monotonic() - started_at
                     )
                     values = build_values(
+                        source_mode,
                         float(source_level),
                         current_value,
                         voltage_value,
                     )
+                    bias_source_level = (
+                        None
+                        if bias_source_chunk is None or index >= len(bias_source_chunk)
+                        else float(bias_source_chunk[index])
+                    )
+                    bias_current_value = (
+                        None
+                        if bias_current_chunk is None or index >= len(bias_current_chunk)
+                        else float(bias_current_chunk[index])
+                    )
+                    bias_voltage_value = (
+                        None
+                        if bias_voltage_chunk is None or index >= len(bias_voltage_chunk)
+                        else float(bias_voltage_chunk[index])
+                    )
+                    bias_values = None
+                    if bias_source_level is not None:
+                        bias_values = build_values(
+                            bias_source_mode,
+                            bias_source_level,
+                            bias_current_value,
+                            bias_voltage_value,
+                        )
                     self.data_ready.emit(
-                        build_payload(sample_timestamp, float(source_level), values)
+                        build_payload(
+                            sample_timestamp,
+                            float(source_level),
+                            values,
+                            bias_source_level,
+                            bias_values,
+                        )
                     )
         except InterruptedError:
             print("Pulse run aborted by user.")
@@ -622,6 +699,8 @@ class MainController:
         self.ui.graph_log_btn.clicked.connect(
             lambda: self.handle_graph_scale_change("log")
         )
+        self.ui.x_axis_combo.currentTextChanged.connect(self.handle_graph_axis_change)
+        self.ui.y_axis_combo.currentTextChanged.connect(self.handle_graph_axis_change)
         self.ui.export_csv_btn.clicked.connect(self.handle_export_csv)
         self.ui.channel_config_changed.connect(self.update_preview_and_summary)
         self.ui.smu_selector.currentIndexChanged.connect(self.update_preview_and_summary)
@@ -718,6 +797,13 @@ class MainController:
         self.ui.graph_linear_btn.setChecked(normalized == "linear")
         self.ui.graph_log_btn.setChecked(normalized == "log")
         self.ui.graph_plot_placeholder.set_display_mode(normalized)
+
+    def handle_graph_axis_change(self, *args: object) -> None:
+        """Redraw the measurement graph with the selected payload axes."""
+        self.ui.graph_plot_placeholder.set_axes(
+            str(self.ui.x_axis_combo.currentText() or "Time"),
+            str(self.ui.y_axis_combo.currentText() or "SMU1 Current"),
+        )
 
     def _set_connected_status(self, model_name: str | None = None) -> None:
         status_text = "Connected"
@@ -1213,7 +1299,26 @@ class MainController:
         if step_mode == "sweep" and step_actual_pts > 0 and step_dual:
             step_actual_pts = step_actual_pts * 2 - 1
 
-        if stepper_text == "None" or step_mode == "fixed":
+        pulse_total_points: int | None = None
+        pulse_configs = []
+        if enabled1 and mode1 == "pulse":
+            pulse_configs.append(settings["smu1"].get("pulse", {}))
+        if enabled2 and mode2 == "pulse":
+            pulse_configs.append(settings["smu2"].get("pulse", {}))
+        if len(pulse_configs) == 1:
+            try:
+                pulse_events = flatten_pulse_config(pulse_configs[0], repeat=repeats)
+                pulse_timeline = build_pulse_timeline(
+                    pulse_events,
+                    float(settings.get("common", {}).get("pulse_sample_interval", 0.001)),
+                )
+                pulse_total_points = len(pulse_timeline)
+            except Exception:
+                pulse_total_points = 0
+
+        if pulse_total_points is not None:
+            total_points = pulse_total_points
+        elif stepper_text == "None" or step_mode == "fixed":
             total_points = max(0, pri_actual_pts) * repeats
         else:
             total_points = max(0, pri_actual_pts) * max(0, step_actual_pts) * repeats
@@ -1332,13 +1437,13 @@ class MainController:
             if enabled and str(cfg.get("mode", "")).strip().lower() == "pulse"
         ]
         if pulse_channels:
-            if len(pulse_channels) != 1 or len(enabled_channels) != 1:
+            if len(pulse_channels) != 1:
                 QMessageBox.information(
                     self.ui,
                     "Pulse Mode",
                     (
-                        "Single-SMU Pulse execution is supported now. "
-                        "Dual-SMU Pulse and Pulse mixed with Fixed/Sweep are not supported yet."
+                        "Only one Pulse SMU is supported now. "
+                        "SMU1 Pulse + SMU2 Pulse is not supported yet."
                     ),
                 )
                 self.ui.run_btn.setEnabled(True)
@@ -1346,19 +1451,72 @@ class MainController:
                 return
 
             smu_name, channel, pulse_cfg = pulse_channels[0]
+            other_name = "SMU 2" if smu_name == "SMU 1" else "SMU 1"
+            other_channel = "smub" if channel == "smua" else "smua"
+            other_settings = settings["smu2"] if channel == "smua" else settings["smu1"]
+            other_enabled = smu2_enabled if channel == "smua" else smu1_enabled
+            other_mode = str(other_settings.get("mode", "")).strip().lower()
+            if other_enabled and other_mode != "fixed":
+                QMessageBox.information(
+                    self.ui,
+                    "Pulse Mode",
+                    "Pulse + Sweep is not supported yet. Use Fixed or disable the other SMU.",
+                )
+                self.ui.run_btn.setEnabled(True)
+                self.ui.abort_btn.setEnabled(False)
+                return
+
             repeat = int(settings.get("common", {}).get("repeat", 1))
+            sample_interval = float(
+                settings.get("common", {}).get(
+                    "pulse_sample_interval",
+                    self.ui.pulse_sample_interval_spin.value(),
+                )
+            )
             try:
                 events = flatten_pulse_config(pulse_cfg.get("pulse", {}), repeat=repeat)
-                validate_pulse_events(events)
+                timeline = build_pulse_timeline(events, sample_interval)
             except Exception as exc:
                 QMessageBox.warning(self.ui, "Invalid Pulse Sequence", str(exc))
                 self.ui.run_btn.setEnabled(True)
                 self.ui.abort_btn.setEnabled(False)
                 return
 
+            nplc = float(self.ui.nplc_spin.value())
+            measure_window_s = nplc * 0.02
+            if sample_interval < measure_window_s:
+                QMessageBox.information(
+                    self.ui,
+                    "Pulse Timing Notice",
+                    (
+                        f"NPLC={nplc:.3g} gives an approximate {measure_window_s:.6g} s "
+                        "measurement window at 50 Hz, which is longer than the pulse "
+                        f"sample interval ({sample_interval:.6g} s). The real instrument "
+                        "may run slower than the requested timeline."
+                    ),
+                )
+
+            bias_config = None
+            bias_measure_cfg: dict[str, Any] = {}
+            if other_enabled:
+                bias_config = {
+                    "smu_name": other_name,
+                    "channel": other_channel,
+                    "source_mode": str(other_settings.get("function", "Voltage")).strip().lower(),
+                    "level": float(other_settings.get("level", 0.0)),
+                    "limit": float(other_settings.get("limit", 0.0)),
+                }
+                bias_measure_cfg = other_settings.get("measure", {})
+
             self.ui.graph_plot_placeholder.clear_plot()
             self.ui.data_table.setRowCount(0)
             self.ui.tab_widget.setCurrentWidget(self.ui.graph_tab)
+            self.ui.x_axis_combo.setCurrentText("Time")
+            self.ui.y_axis_combo.setCurrentText(f"{smu_name.replace(' ', '')} Current")
+            self.ui.graph_plot_placeholder.set_axes(
+                "Time",
+                f"{smu_name.replace(' ', '')} Current",
+            )
             self._autoscale_after_first_point = True
             QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
 
@@ -1367,10 +1525,12 @@ class MainController:
                 "channel": channel,
                 "source_mode": str(pulse_cfg.get("function", "Voltage")).strip().lower(),
                 "source_limit": float(pulse_cfg.get("limit", 0.0)),
-                "events": events,
+                "timeline": timeline,
                 "measure_cfg": settings["smu1"]["measure"]
                 if channel == "smua"
                 else settings["smu2"]["measure"],
+                "bias_config": bias_config,
+                "bias_measure_cfg": bias_measure_cfg,
                 "nplc": float(self.ui.nplc_spin.value()),
             }
 
@@ -1544,6 +1704,13 @@ class MainController:
         self.ui.graph_plot_placeholder.clear_plot()
         self.ui.data_table.setRowCount(0)
         self.ui.tab_widget.setCurrentWidget(self.ui.graph_tab)
+        primary_axis_prefix = "SMU1" if primary_channel == "smua" else "SMU2"
+        self.ui.x_axis_combo.setCurrentText(f"{primary_axis_prefix} Voltage")
+        self.ui.y_axis_combo.setCurrentText(f"{primary_axis_prefix} Current")
+        self.ui.graph_plot_placeholder.set_axes(
+            f"{primary_axis_prefix} Voltage",
+            f"{primary_axis_prefix} Current",
+        )
         self._autoscale_after_first_point = True
         QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
 
@@ -1619,30 +1786,7 @@ class MainController:
         """
         Slot for SweepWorker.data_ready: update graph and table in the UI thread.
         """
-        series_name = str(payload.get("series_name", ""))
-        primary_name = str(payload.get("primary_name", ""))
-        smu1_values = payload.get("smu1", {}).get("values", {})
-        smu2_values = payload.get("smu2", {}).get("values", {})
-
-        if primary_name == "SMU 1":
-            sweep_x = smu1_values.get("Voltage")
-        else:
-            sweep_x = smu2_values.get("Voltage")
-
-        if sweep_x is not None and "Current" in smu1_values:
-            self.ui.graph_plot_placeholder.append_data_point(
-                "SMU 1",
-                float(sweep_x),
-                float(smu1_values["Current"]),
-                series_name,
-            )
-        if sweep_x is not None and "Current" in smu2_values:
-            self.ui.graph_plot_placeholder.append_data_point(
-                "SMU 2",
-                float(sweep_x),
-                float(smu2_values["Current"]),
-                series_name,
-            )
+        self.ui.graph_plot_placeholder.append_payload(payload)
 
         row = self.ui.data_table.rowCount()
         self.ui.data_table.insertRow(row)
