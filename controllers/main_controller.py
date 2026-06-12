@@ -15,8 +15,10 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
 from core.instrument_base import AbstractSMU
 from core.pulse_sequence import (
     PulseTimelinePoint,
+    build_pulse_list_sweep_plan,
     build_pulse_timeline,
     flatten_pulse_config,
+    pulse_list_sweep_levels_to_csv,
 )
 
 if TYPE_CHECKING:
@@ -453,7 +455,12 @@ class PulseWorker(QThread):
         smu_name: str = p["smu_name"]
         source_mode: str = p["source_mode"]
         source_limit: float = p["source_limit"]
-        timeline: list[PulseTimelinePoint] = list(p["timeline"])
+        use_list_sweep_sampling = bool(p.get("pulse_list_sweep_sampling", False))
+        timeline: list[PulseTimelinePoint] = list(p.get("timeline", []))
+        source_levels: list[float] = [
+            float(level) for level in p.get("source_levels", [])
+        ]
+        src_to_meas_delay_s = float(p.get("src_to_meas_delay_s", 0.0))
         measure_cfg: dict[str, Any] = p["measure_cfg"]
         bias_cfg: dict[str, Any] | None = p.get("bias_config")
         bias_measure_cfg: dict[str, Any] = p.get("bias_measure_cfg", {})
@@ -558,16 +565,25 @@ class PulseWorker(QThread):
                 inactive_channel = "smub" if channel == "smua" else "smua"
                 self.instrument.set_output(inactive_channel, False)
 
-            for (
-                source_chunk,
-                current_chunk,
-                voltage_chunk,
-                bias_source_chunk,
-                bias_current_chunk,
-                bias_voltage_chunk,
-                timestamp_chunk,
-            ) in (
-                self.instrument.run_pulse_timeline(
+            if use_list_sweep_sampling:
+                runner = getattr(self.instrument, "run_pulse_list_sweep", None)
+                if not callable(runner):
+                    raise RuntimeError(
+                        "The active instrument driver does not support pulse list "
+                        "sweep sampling."
+                    )
+                pulse_chunks = runner(
+                    channel,
+                    source_mode,
+                    source_levels,
+                    src_to_meas_delay_s,
+                    source_limit,
+                    list(measure_cfg.get("items", [])),
+                    bias_cfg,
+                    abort_if_requested,
+                )
+            else:
+                pulse_chunks = self.instrument.run_pulse_timeline(
                     channel,
                     source_mode,
                     timeline,
@@ -576,7 +592,16 @@ class PulseWorker(QThread):
                     bias_cfg,
                     abort_if_requested,
                 )
-            ):
+
+            for (
+                source_chunk,
+                current_chunk,
+                voltage_chunk,
+                bias_source_chunk,
+                bias_current_chunk,
+                bias_voltage_chunk,
+                timestamp_chunk,
+            ) in pulse_chunks:
                 abort_if_requested()
                 for index, source_level in enumerate(source_chunk):
                     current_value = (
@@ -763,6 +788,30 @@ class MainController:
         if enabled1 and enabled2 and stepper_text == f"SMU {smu_index}":
             return self.ui.stepper_points_spin
         return self.ui.sweep_points_spin
+
+    def _line_frequency_hz(self) -> float:
+        getter = getattr(self.instrument, "get_line_frequency_hz", None)
+        if callable(getter):
+            try:
+                value = float(getter())
+            except Exception as exc:
+                print(
+                    "Warning: failed to read instrument line frequency; "
+                    f"falling back to 60.0 Hz. ({exc})"
+                )
+            else:
+                if value > 0.0:
+                    return value
+                print(
+                    "Warning: instrument returned invalid line frequency; "
+                    "falling back to 60.0 Hz."
+                )
+        else:
+            print(
+                "Warning: instrument line frequency is unavailable; "
+                "falling back to 60.0 Hz."
+            )
+        return 60.0
 
     def _set_step_control_value(
         self,
@@ -997,6 +1046,20 @@ class MainController:
             "Export Complete",
             f"CSV saved to:\n{file_path}",
         )
+
+    def _log_pulse_list_sweep_plan(self, plan: Any) -> None:
+        print(
+            "Pulse list sweep metadata: "
+            f"measurement_window_s={plan.measurement_window_s:.9g}, "
+            f"src_to_meas_delay_s={plan.src_to_meas_delay_s:.9g}, "
+            f"point_interval_s={plan.point_interval_s:.9g}, "
+            f"total_points={plan.total_points}"
+        )
+        if plan.warnings:
+            for warning in plan.warnings:
+                print(f"Pulse list sweep warning: {warning}")
+        else:
+            print("Pulse list sweep warnings: none")
 
     def update_preview_and_summary(self, *args: object) -> None:
         """
@@ -1300,6 +1363,7 @@ class MainController:
             step_actual_pts = step_actual_pts * 2 - 1
 
         pulse_total_points: int | None = None
+        pulse_point_interval_s: float | None = None
         pulse_configs = []
         if enabled1 and mode1 == "pulse":
             pulse_configs.append(settings["smu1"].get("pulse", {}))
@@ -1308,11 +1372,36 @@ class MainController:
         if len(pulse_configs) == 1:
             try:
                 pulse_events = flatten_pulse_config(pulse_configs[0], repeat=repeats)
-                pulse_timeline = build_pulse_timeline(
-                    pulse_events,
-                    float(settings.get("common", {}).get("pulse_sample_interval", 0.001)),
-                )
-                pulse_total_points = len(pulse_timeline)
+                common_settings = settings.get("common", {})
+                if bool(common_settings.get("pulse_list_sweep_sampling", False)):
+                    pulse_plan = build_pulse_list_sweep_plan(
+                        pulse_events,
+                        nplc=float(common_settings.get("nplc", self.ui.nplc_spin.value())),
+                        line_frequency_hz=self._line_frequency_hz(),
+                        src_to_meas_delay_s=float(
+                            common_settings.get(
+                                "src_meas_delay",
+                                self.ui.src_meas_delay_spin.value(),
+                            )
+                        ),
+                    )
+                    pulse_total_points = len(pulse_plan.source_levels)
+                    pulse_point_interval_s = pulse_plan.point_interval_s
+                    self._log_pulse_list_sweep_plan(pulse_plan)
+                else:
+                    pulse_timeline = build_pulse_timeline(
+                        pulse_events,
+                        float(
+                            common_settings.get(
+                                "pulse_sample_interval",
+                                0.001,
+                            )
+                        ),
+                    )
+                    pulse_total_points = len(pulse_timeline)
+            except ValueError as exc:
+                print(f"Invalid pulse sequence: {exc}")
+                pulse_total_points = 0
             except Exception:
                 pulse_total_points = 0
 
@@ -1323,7 +1412,12 @@ class MainController:
         else:
             total_points = max(0, pri_actual_pts) * max(0, step_actual_pts) * repeats
 
-        self.ui.calculated_points_label.setText(f"{total_points:,}")
+        if pulse_point_interval_s is not None:
+            self.ui.calculated_points_label.setText(
+                f"{total_points:,} points, interval \u2248 {pulse_point_interval_s:.6g} s"
+            )
+        else:
+            self.ui.calculated_points_label.setText(f"{total_points:,}")
 
         # ----- Pack config and update Output Preview -----
         src_meas_delay = float(self.ui.src_meas_delay_spin.value())
@@ -1466,16 +1560,64 @@ class MainController:
                 self.ui.abort_btn.setEnabled(False)
                 return
 
-            repeat = int(settings.get("common", {}).get("repeat", 1))
-            sample_interval = float(
-                settings.get("common", {}).get(
-                    "pulse_sample_interval",
-                    self.ui.pulse_sample_interval_spin.value(),
+            common_settings = settings.get("common", {})
+            repeat = int(common_settings.get("repeat", 1))
+            use_list_sweep_sampling = bool(
+                common_settings.get("pulse_list_sweep_sampling", False)
+            )
+            timeline: list[PulseTimelinePoint] | None = None
+            source_levels: list[float] | None = None
+            src_to_meas_delay_s = float(
+                common_settings.get(
+                    "src_meas_delay",
+                    self.ui.src_meas_delay_spin.value(),
                 )
             )
             try:
                 events = flatten_pulse_config(pulse_cfg.get("pulse", {}), repeat=repeat)
-                timeline = build_pulse_timeline(events, sample_interval)
+                if use_list_sweep_sampling:
+                    plan = build_pulse_list_sweep_plan(
+                        events,
+                        nplc=float(common_settings.get("nplc", self.ui.nplc_spin.value())),
+                        line_frequency_hz=self._line_frequency_hz(),
+                        src_to_meas_delay_s=src_to_meas_delay_s,
+                    )
+                    source_levels = list(plan.source_levels)
+                    self._log_pulse_list_sweep_plan(plan)
+                    with open(
+                        "pulse_generated_list.csv",
+                        "w",
+                        newline="",
+                        encoding="utf-8",
+                    ) as fh:
+                        fh.write(pulse_list_sweep_levels_to_csv(source_levels))
+                else:
+                    sample_interval = float(
+                        common_settings.get(
+                            "pulse_sample_interval",
+                            self.ui.pulse_sample_interval_spin.value(),
+                        )
+                    )
+                    timeline = build_pulse_timeline(events, sample_interval)
+                    # TEMP: export the final generated pulse list for inspection.
+                    # Comment/remove this block after debugging.
+                    with open("pulse_generated_list.csv", "w", newline="", encoding="utf-8") as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow(["index", "time_s", "source_level", "dwell_to_next_s"])
+                        for index, point in enumerate(timeline, start=1):
+                            writer.writerow(
+                                [
+                                    index,
+                                    point.time_s,
+                                    point.source_level,
+                                    point.dwell_to_next_s,
+                                ]
+                            )
+            except ValueError as exc:
+                QMessageBox.warning(self.ui, "Invalid Pulse Sequence", str(exc))
+                self.ui.run_btn.setEnabled(True)
+                self.ui.abort_btn.setEnabled(False)
+                return
             except Exception as exc:
                 QMessageBox.warning(self.ui, "Invalid Pulse Sequence", str(exc))
                 self.ui.run_btn.setEnabled(True)
@@ -1483,8 +1625,22 @@ class MainController:
                 return
 
             nplc = float(self.ui.nplc_spin.value())
-            measure_window_s = nplc * 0.02
-            if sample_interval < measure_window_s:
+            if not use_list_sweep_sampling:
+                sample_interval = float(
+                    common_settings.get(
+                        "pulse_sample_interval",
+                        self.ui.pulse_sample_interval_spin.value(),
+                    )
+                )
+                measure_window_s = nplc * 0.02
+            else:
+                sample_interval = None
+                measure_window_s = 0.0
+            if (
+                not use_list_sweep_sampling
+                and sample_interval is not None
+                and sample_interval < measure_window_s
+            ):
                 QMessageBox.information(
                     self.ui,
                     "Pulse Timing Notice",
@@ -1525,7 +1681,10 @@ class MainController:
                 "channel": channel,
                 "source_mode": str(pulse_cfg.get("function", "Voltage")).strip().lower(),
                 "source_limit": float(pulse_cfg.get("limit", 0.0)),
-                "timeline": timeline,
+                "pulse_list_sweep_sampling": use_list_sweep_sampling,
+                "timeline": timeline or [],
+                "source_levels": source_levels or [],
+                "src_to_meas_delay_s": src_to_meas_delay_s,
                 "measure_cfg": settings["smu1"]["measure"]
                 if channel == "smua"
                 else settings["smu2"]["measure"],

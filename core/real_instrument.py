@@ -10,6 +10,7 @@ chunked data streaming.
 import math
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Generator
 
@@ -42,6 +43,8 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_RESOURCE_ENCODING = "latin-1"
     DUAL_SYNC_SCRIPT_NAME = "oai_dualsync"
     PULSE_SCRIPT_NAME = "oai_pulse"
+    TSP_TABLE_CHUNK_SIZE = 25
+    TSP_FINAL_ENDPULSE_DELAY_S = 5e-7
 
     def __init__(self, debug: bool = False) -> None:
         self.debug = debug
@@ -55,6 +58,7 @@ class RealKeithley2636(AbstractSMU):
         self._instrument_model = "2636B" if debug else None
         self._dual_sync_script_loaded = bool(debug)
         self._pulse_script_loaded = bool(debug)
+        self._io_lock = threading.RLock()
 
     @staticmethod
     def _create_resource_manager():
@@ -107,15 +111,17 @@ class RealKeithley2636(AbstractSMU):
             return
         if self._resource is None:
             raise RuntimeError("Instrument not connected; call connect() first.")
-        self._resource.write(cmd)
+        with self._io_lock:
+            self._resource.write(cmd)
 
     def _query_cmd(self, cmd: str) -> str:
         if self.debug:
             return "1.23e-6"
         if self._resource is None:
             raise RuntimeError("Instrument not connected; call connect() first.")
-        self._resource.write(cmd)
-        return self._read_response().strip()
+        with self._io_lock:
+            self._resource.write(cmd)
+            return self._read_response().strip()
 
     def _read_response(self) -> str:
         if self._resource is None:
@@ -139,6 +145,43 @@ class RealKeithley2636(AbstractSMU):
             "\x00\r\n "
         )
 
+    def _read_response_with_timeout(self, timeout_ms: int) -> str:
+        if self._resource is None:
+            raise RuntimeError("Instrument not connected; call connect() first.")
+
+        original_timeout = getattr(self._resource, "timeout", None)
+        try:
+            self._resource.timeout = timeout_ms
+            return self._read_response()
+        finally:
+            if original_timeout is not None:
+                self._resource.timeout = original_timeout
+
+    def _drain_output_queue(self, max_reads: int = 8) -> list[str]:
+        if self.debug or self._resource is None:
+            return []
+
+        drained: list[str] = []
+        with self._io_lock:
+            for _ in range(max_reads):
+                try:
+                    reply = self._read_response_with_timeout(100)
+                except Exception:
+                    break
+                if not reply:
+                    break
+                drained.append(reply)
+        return drained
+
+    def _write_tsp_script_block(self, script_name: str, script_body: str) -> None:
+        if self._resource is None:
+            raise RuntimeError("Instrument not connected; call connect() first.")
+
+        self._resource.write(f"loadandrunscript {script_name}")
+        for line in script_body.strip("\r\n").splitlines():
+            self._resource.write(line.rstrip() if line.strip() else "--")
+        self._resource.write("endscript")
+
     def _load_tsp_script(self, script_name: str, script_body: str) -> None:
         # FIX: Use `loadandrunscript` so the named script is compiled and executed immediately.
         if self.debug:
@@ -148,28 +191,27 @@ class RealKeithley2636(AbstractSMU):
         if self._resource is None:
             raise RuntimeError("Instrument not connected; call connect() first.")
         # FIX: Clear stale parser/runtime errors before attempting to load a script.
-        self._send_cmd("*CLS")
-        self._send_cmd("errorqueue.clear()")
-        normalized_body = script_body.strip("\r\n")
-        full_script = f"loadandrunscript {script_name}\n{normalized_body}\nendscript"
-        # FIX: Use the underlying VISA resource directly so the entire script block is written once.
-        self._resource.write(full_script)
-        # FIX: Fail fast if the script produced any syntax/runtime error while loading or running.
-        errors = self.dump_errors()
-        if errors:
-            # FIX: Dump numbered script lines so Keithley TSP line numbers can be matched quickly.
-            self._debug_dump_script_lines(script_body)
-            error_lines = "\n".join(
-                f"  {index}. {entry}" for index, entry in enumerate(errors, start=1)
+        with self._io_lock:
+            self._drain_output_queue()
+            self._send_cmd("*CLS")
+            self._send_cmd("errorqueue.clear()")
+            self._write_tsp_script_block(script_name, script_body)
+            # FIX: Fail fast if the script produced any syntax/runtime error while loading or running.
+            errors = self.dump_errors()
+            if errors:
+                # FIX: Dump numbered script lines so Keithley TSP line numbers can be matched quickly.
+                self._debug_dump_script_lines(script_body)
+                error_lines = "\n".join(
+                    f"  {index}. {entry}" for index, entry in enumerate(errors, start=1)
+                )
+                raise RuntimeError(
+                    f"Failed to load TSP script '{script_name}'.\nError queue:\n{error_lines}"
+                )
+            # FIX: Verify the script run registered callable global functions.
+            type_reply = self._query_cmd_checked(
+                "print(type(configure_block), type(wait_done))",
+                f"verifying TSP globals for '{script_name}'",
             )
-            raise RuntimeError(
-                f"Failed to load TSP script '{script_name}'.\nError queue:\n{error_lines}"
-            )
-        # FIX: Verify the script run registered callable global functions.
-        type_reply = self._query_cmd_checked(
-            "print(type(configure_block), type(wait_done))",
-            f"verifying TSP globals for '{script_name}'",
-        )
         type_tokens = [
             token.strip().lower()
             for token in re.split(r"[\s,]+", type_reply)
@@ -200,26 +242,26 @@ class RealKeithley2636(AbstractSMU):
         if self._resource is None:
             raise RuntimeError("Instrument not connected; call connect() first.")
 
-        self._send_cmd("*CLS")
-        self._send_cmd("errorqueue.clear()")
-        normalized_body = script_body.strip("\r\n")
-        full_script = f"loadandrunscript {script_name}\n{normalized_body}\nendscript"
-        self._resource.write(full_script)
-        errors = self.dump_errors()
-        if errors:
-            self._debug_dump_script_lines(script_body)
-            error_lines = "\n".join(
-                f"  {index}. {entry}" for index, entry in enumerate(errors, start=1)
-            )
-            raise RuntimeError(
-                f"Failed to load TSP script '{script_name}'.\nError queue:\n{error_lines}"
-            )
+        with self._io_lock:
+            self._drain_output_queue()
+            self._send_cmd("*CLS")
+            self._send_cmd("errorqueue.clear()")
+            self._write_tsp_script_block(script_name, script_body)
+            errors = self.dump_errors()
+            if errors:
+                self._debug_dump_script_lines(script_body)
+                error_lines = "\n".join(
+                    f"  {index}. {entry}" for index, entry in enumerate(errors, start=1)
+                )
+                raise RuntimeError(
+                    f"Failed to load TSP script '{script_name}'.\nError queue:\n{error_lines}"
+                )
 
-        expr = ", ".join(f"type({name})" for name in function_names)
-        type_reply = self._query_cmd_checked(
-            f"print({expr})",
-            f"verifying TSP globals for '{script_name}'",
-        )
+            expr = ", ".join(f"type({name})" for name in function_names)
+            type_reply = self._query_cmd_checked(
+                f"print({expr})",
+                f"verifying TSP globals for '{script_name}'",
+            )
         type_tokens = [
             token.strip().lower()
             for token in re.split(r"[\s,]+", type_reply)
@@ -237,7 +279,22 @@ class RealKeithley2636(AbstractSMU):
     def _error_queue_count(self) -> int:
         if self.debug:
             return 0
-        return int(float(self._query_cmd("print(errorqueue.count)")))
+        with self._io_lock:
+            replies = [self._query_cmd("print(errorqueue.count)")]
+            for _ in range(2):
+                try:
+                    return int(float(replies[-1]))
+                except ValueError:
+                    try:
+                        replies.append(self._read_response_with_timeout(250).strip())
+                    except Exception:
+                        break
+
+        details = ", ".join(repr(reply) for reply in replies if reply)
+        raise RuntimeError(
+            "Expected numeric reply from errorqueue.count, got "
+            f"{details or '<empty>'}. Instrument responses may be out of sync."
+        )
 
     def _raise_if_error_queue(self, context: str) -> None:
         count = self._error_queue_count()
@@ -251,13 +308,15 @@ class RealKeithley2636(AbstractSMU):
         raise RuntimeError("\n".join(message))
 
     def _send_cmd_checked(self, cmd: str, context: str) -> None:
-        self._send_cmd(cmd)
-        self._raise_if_error_queue(context)
+        with self._io_lock:
+            self._send_cmd(cmd)
+            self._raise_if_error_queue(context)
 
     def _query_cmd_checked(self, cmd: str, context: str) -> str:
-        reply = self._query_cmd(cmd)
-        self._raise_if_error_queue(context)
-        return reply
+        with self._io_lock:
+            reply = self._query_cmd(cmd)
+            self._raise_if_error_queue(context)
+            return reply
 
     def _ensure_ascii_stream_format(self) -> None:
         if self.debug:
@@ -577,6 +636,22 @@ end
     def _format_tsp_table(self, values: list[float]) -> str:
         return "{" + ", ".join(self._format_tsp_value(float(value)) for value in values) + "}"
 
+    def _load_tsp_numeric_table(self, name: str, values: list[float]) -> None:
+        if self.debug:
+            return
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(f"Invalid TSP table name: {name!r}")
+
+        with self._io_lock:
+            self._send_cmd(f"{name} = {{}}")
+            for start in range(0, len(values), self.TSP_TABLE_CHUNK_SIZE):
+                chunk = values[start : start + self.TSP_TABLE_CHUNK_SIZE]
+                for value in chunk:
+                    self._send_cmd(
+                        f"table.insert({name}, {self._format_tsp_value(float(value))})"
+                    )
+            self._raise_if_error_queue(f"loading TSP table {name}")
+
     def connect(self, resource_str: str) -> bool:
         if self.debug:
             print(f"[DEBUG] Virtual connection OK: {resource_str}")
@@ -772,6 +847,7 @@ end
             "last": {},
             "current_range": str(current_range or "").strip() or "Auto",
             "range_amps": range_amps,
+            "nplc": float(nplc),
         }
 
         autozero_map = {
@@ -952,6 +1028,111 @@ function configure_pulse(cn, on, smode, levels, widths, periods, n, lim)
     c.trigger.initiate()
 end
 
+function configure_pulse_list_sweep(cn, on, smode, levels, n, dt, lim, bmode, blev, blim, measure_bias)
+    local c = _G[cn]
+    local b = nil
+    if on ~= nil then
+        b = _G[on]
+    end
+    if c == nil then
+        error("Unknown pulse SMU: " .. tostring(cn))
+    end
+    if dt == nil or dt < 0 then
+        dt = 0
+    end
+
+    c.abort()
+    if b ~= nil then
+        b.abort()
+    end
+    trigger.blender[1].reset()
+    trigger.timer[1].reset()
+
+    _pulse_pb(c)
+    if b ~= nil then
+        _pulse_pb(b)
+    end
+
+    if smode == 1 then
+        c.source.func = c.OUTPUT_DCAMPS
+        if lim ~= nil and lim > 0 then
+            c.source.limitv = lim
+        end
+        c.source.leveli = 0
+        c.trigger.source.listi(levels)
+    else
+        c.source.func = c.OUTPUT_DCVOLTS
+        if lim ~= nil and lim > 0 then
+            c.source.limiti = lim
+        end
+        c.source.levelv = 0
+        c.trigger.source.listv(levels)
+    end
+
+    c.source.delay = 0
+    c.measure.delay = 0
+    c.trigger.source.action = c.ENABLE
+    c.trigger.measure.iv(c.nvbuffer1, c.nvbuffer2)
+    c.trigger.measure.action = c.ENABLE
+    c.trigger.count = n
+    c.trigger.arm.count = 1
+    c.trigger.arm.stimulus = 0
+
+    trigger.timer[1].delay = dt
+    trigger.timer[1].count = 1
+    trigger.timer[1].passthrough = false
+    trigger.timer[1].stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
+    c.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
+
+    trigger.blender[1].orenable = true
+    trigger.blender[1].stimulus[1] = c.trigger.ARMED_EVENT_ID
+    trigger.blender[1].stimulus[2] = c.trigger.PULSE_COMPLETE_EVENT_ID
+    c.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+
+    c.trigger.endpulse.action = c.SOURCE_HOLD
+    c.trigger.endpulse.stimulus = c.trigger.MEASURE_COMPLETE_EVENT_ID
+    c.trigger.endsweep.action = c.SOURCE_IDLE
+
+    if b ~= nil then
+        if bmode == 1 then
+            b.source.func = b.OUTPUT_DCAMPS
+            if blim ~= nil and blim > 0 then
+                b.source.limitv = blim
+            end
+            b.source.leveli = blev
+        else
+            b.source.func = b.OUTPUT_DCVOLTS
+            if blim ~= nil and blim > 0 then
+                b.source.limiti = blim
+            end
+            b.source.levelv = blev
+        end
+        b.source.delay = 0
+        b.measure.delay = 0
+        b.trigger.source.action = b.DISABLE
+        if measure_bias ~= 0 then
+            b.trigger.measure.iv(b.nvbuffer1, b.nvbuffer2)
+            b.trigger.measure.action = b.ENABLE
+            b.trigger.count = n
+            b.trigger.arm.count = 1
+            b.trigger.arm.stimulus = 0
+            b.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
+            b.trigger.endpulse.action = b.SOURCE_HOLD
+            b.trigger.endpulse.stimulus = b.trigger.MEASURE_COMPLETE_EVENT_ID
+            b.trigger.endsweep.action = b.SOURCE_HOLD
+        else
+            b.trigger.measure.action = b.DISABLE
+        end
+        b.source.output = b.OUTPUT_ON
+    end
+
+    if b ~= nil and measure_bias ~= 0 then
+        b.trigger.initiate()
+    end
+    c.source.output = c.OUTPUT_ON
+    c.trigger.initiate()
+end
+
 function wait_pulse_done()
     waitcomplete()
 end
@@ -1006,20 +1187,21 @@ function configure_pulse_timeline(cn, on, smode, levels, delays, n, lim, bmode, 
 
     if n > 1 then
         trigger.timer[2].delaylist = delays
-        trigger.timer[2].count = n - 1
+        trigger.timer[2].count = n
         trigger.timer[2].passthrough = false
         trigger.timer[2].stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
 
         trigger.blender[1].orenable = true
         trigger.blender[1].stimulus[1] = c.trigger.ARMED_EVENT_ID
-        trigger.blender[1].stimulus[2] = trigger.timer[2].EVENT_ID
+        trigger.blender[1].stimulus[2] = c.trigger.PULSE_COMPLETE_EVENT_ID
         c.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+        c.trigger.endpulse.stimulus = trigger.timer[2].EVENT_ID
     else
         c.trigger.source.stimulus = 0
+        c.trigger.endpulse.stimulus = c.trigger.MEASURE_COMPLETE_EVENT_ID
     end
 
     c.trigger.endpulse.action = c.SOURCE_HOLD
-    c.trigger.endpulse.stimulus = c.trigger.MEASURE_COMPLETE_EVENT_ID
     c.trigger.endsweep.action = c.SOURCE_IDLE
 
     if b ~= nil then
@@ -1047,6 +1229,7 @@ function configure_pulse_timeline(cn, on, smode, levels, delays, n, lim, bmode, 
             b.trigger.arm.stimulus = 0
             b.trigger.measure.stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
             b.trigger.endpulse.action = b.SOURCE_HOLD
+            b.trigger.endpulse.stimulus = b.trigger.MEASURE_COMPLETE_EVENT_ID
             b.trigger.endsweep.action = b.SOURCE_HOLD
         else
             b.trigger.measure.action = b.DISABLE
@@ -1071,7 +1254,12 @@ end
         self._load_tsp_script_with_functions(
             self.PULSE_SCRIPT_NAME,
             self._build_pulse_script(),
-            ["configure_pulse", "configure_pulse_timeline", "wait_pulse_done"],
+            [
+                "configure_pulse",
+                "configure_pulse_list_sweep",
+                "configure_pulse_timeline",
+                "wait_pulse_done",
+            ],
         )
         self._pulse_script_loaded = True
 
@@ -1153,14 +1341,17 @@ end
                 self._source_levels[inactive_channel] = 0.0
                 return
 
+            self._load_tsp_numeric_table("oai_pulse_levels", levels)
+            self._load_tsp_numeric_table("oai_pulse_widths", widths)
+            self._load_tsp_numeric_table("oai_pulse_periods", periods)
             self._send_cmd_checked(
                 "configure_pulse("
                 f"{self._format_tsp_value(active_channel)}, "
                 f"{self._format_tsp_value(inactive_channel)}, "
                 f"{source_mode_token}, "
-                f"{self._format_tsp_table(levels)}, "
-                f"{self._format_tsp_table(widths)}, "
-                f"{self._format_tsp_table(periods)}, "
+                "oai_pulse_levels, "
+                "oai_pulse_widths, "
+                "oai_pulse_periods, "
                 f"{total_points}, "
                 f"{self._format_tsp_value(limit)})",
                 f"starting pulse sequence on {active_channel}",
@@ -1270,6 +1461,7 @@ end
 
             levels = [float(point.source_level) for point in timeline]
             delays = [float(point.dwell_to_next_s) for point in timeline[:-1]]
+            delays.append(self.TSP_FINAL_ENDPULSE_DELAY_S)
             timestamps = [float(point.time_s) for point in timeline]
             total_points = len(timeline)
 
@@ -1355,13 +1547,15 @@ end
                     self._source_levels[bias_channel] = bias_level
                 return
 
+            self._load_tsp_numeric_table("oai_pulse_levels", levels)
+            self._load_tsp_numeric_table("oai_pulse_delays", delays)
             self._send_cmd_checked(
                 "configure_pulse_timeline("
                 f"{self._format_tsp_value(active_channel)}, "
                 f"{self._format_tsp_value(bias_channel)}, "
                 f"{source_mode_token}, "
-                f"{self._format_tsp_table(levels)}, "
-                f"{self._format_tsp_table(delays)}, "
+                "oai_pulse_levels, "
+                "oai_pulse_delays, "
                 f"{total_points}, "
                 f"{self._format_tsp_value(limit)}, "
                 f"{bias_mode_token}, "
@@ -1460,6 +1654,284 @@ end
             self._query_cmd_checked(
                 "wait_pulse_done() print(1)",
                 "waiting for pulse timeline completion",
+            )
+            self._source_levels[active_channel] = 0.0
+            if bias_channel is not None:
+                self._source_levels[bias_channel] = bias_level
+        except Exception:
+            self._recover_from_sweep_error()
+            raise
+
+    def run_pulse_list_sweep(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        source_levels: list[float],
+        src_to_meas_delay_s: float,
+        nplc: float,
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        bias_config: dict | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        if callable(bias_config) and stop_checker is None:
+            stop_checker = bias_config
+            bias_config = measurement_items if isinstance(measurement_items, dict) else None
+            measurement_items = (
+                list(source_limit)
+                if isinstance(source_limit, list)
+                else None
+            )
+            source_limit = float(nplc) if isinstance(nplc, (int, float)) else None
+            nplc = float(self._measure_state.get(smu_channel, {}).get("nplc", 1.0))
+
+        if not source_levels:
+            return
+
+        self._ensure_ascii_stream_format()
+        self._ensure_pulse_script_loaded()
+        self._raise_if_error_queue("preparing pulse list sweep")
+
+        try:
+            self._clear_error_state()
+            active_channel = smu_channel
+            normalized_mode = str(source_mode or "voltage").strip().lower()
+            source_mode_token = 1 if normalized_mode == "current" else 0
+            limit = source_limit
+            if limit is None:
+                limit = self._source_limits.get(active_channel)
+
+            levels = [float(level) for level in source_levels]
+            total_points = len(levels)
+            delay_s = max(float(src_to_meas_delay_s), 0.0)
+            effective_nplc = max(float(nplc), 0.0)
+
+            bias_channel: str | None = None
+            bias_mode_token = 0
+            bias_level = 0.0
+            bias_limit: float | None = None
+            measure_bias = False
+            if isinstance(bias_config, dict):
+                unsupported_mode = str(
+                    bias_config.get("mode", bias_config.get("sweep_mode", "fixed"))
+                ).strip().lower()
+                if unsupported_mode not in {"", "fixed", "constant"}:
+                    raise ValueError(
+                        "Pulse list sweep currently supports only fixed bias mode."
+                    )
+                bias_channel = str(bias_config.get("channel", "")).strip() or None
+                bias_mode = str(bias_config.get("source_mode", "voltage")).strip().lower()
+                bias_mode_token = 1 if bias_mode == "current" else 0
+                bias_level = float(bias_config.get("level", 0.0))
+                bias_limit = float(bias_config.get("limit", 0.0))
+                measure_bias = bias_channel is not None
+
+            self._source_modes[active_channel] = normalized_mode
+            if bias_channel is not None:
+                self._source_modes[bias_channel] = (
+                    "current" if bias_mode_token == 1 else "voltage"
+                )
+
+            def _abort_if_requested() -> None:
+                if stop_checker is None or not stop_checker():
+                    return
+                self.abort_sweep()
+                raise InterruptedError("Pulse run aborted by user.")
+
+            def _configure_list_measurement(channel: str) -> None:
+                self._send_cmd_checked(
+                    f"{channel}.measure.nplc = {effective_nplc}",
+                    f"setting pulse list sweep NPLC on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.filter.enable = {channel}.FILTER_OFF",
+                    f"disabling pulse list sweep filter on {channel}",
+                )
+                self._apply_current_measure_range(channel)
+
+            def _debug_pulse_list_data() -> tuple[
+                list[float],
+                list[float] | None,
+                list[float] | None,
+                list[float] | None,
+                list[float] | None,
+                list[float] | None,
+                list[float],
+            ]:
+                point_interval_s = effective_nplc / 60.0 + delay_s
+                timestamps = [
+                    float(index) * point_interval_s for index in range(len(levels))
+                ]
+                if source_mode_token == 1:
+                    active_currents = list(levels)
+                    active_voltages = [
+                        0.05 + level * 1.0e5 + index * 1e-4
+                        for index, level in enumerate(levels)
+                    ]
+                else:
+                    active_voltages = list(levels)
+                    active_currents = [
+                        1.23e-6 + level * 1e-7 + index * 1e-9
+                        for index, level in enumerate(levels)
+                    ]
+
+                bias_sources: list[float] | None = None
+                bias_currents: list[float] | None = None
+                bias_voltages: list[float] | None = None
+                if bias_channel is not None:
+                    bias_sources = [bias_level] * len(levels)
+                    if bias_mode_token == 1:
+                        bias_currents = list(bias_sources)
+                        bias_voltages = [
+                            0.02 + bias_level * 1.0e5 + index * 5e-5
+                            for index in range(len(levels))
+                        ]
+                    else:
+                        bias_voltages = list(bias_sources)
+                        bias_currents = [
+                            8.9e-7 + bias_level * 8e-8 + index * 1e-9
+                            for index in range(len(levels))
+                        ]
+                return (
+                    levels,
+                    active_currents,
+                    active_voltages,
+                    bias_sources,
+                    bias_currents,
+                    bias_voltages,
+                    timestamps,
+                )
+
+            if self.debug:
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                yield _debug_pulse_list_data()
+                self._source_levels[active_channel] = 0.0
+                if bias_channel is not None:
+                    self._source_levels[bias_channel] = bias_level
+                return
+
+            _configure_list_measurement(active_channel)
+            if bias_channel is not None:
+                _configure_list_measurement(bias_channel)
+
+            self._load_tsp_numeric_table("oai_pulse_levels", levels)
+            self._send_cmd_checked(
+                "configure_pulse_list_sweep("
+                f"{self._format_tsp_value(active_channel)}, "
+                f"{self._format_tsp_value(bias_channel)}, "
+                f"{source_mode_token}, "
+                "oai_pulse_levels, "
+                f"{total_points}, "
+                f"{self._format_tsp_value(delay_s)}, "
+                f"{self._format_tsp_value(limit)}, "
+                f"{bias_mode_token}, "
+                f"{self._format_tsp_value(bias_level)}, "
+                f"{self._format_tsp_value(bias_limit)}, "
+                f"{1 if measure_bias else 0})",
+                f"starting pulse list sweep on {active_channel}",
+            )
+
+            old_n = 0
+            while old_n < total_points:
+                time.sleep(self.DEFAULT_POLL_INTERVAL_S)
+                _abort_if_requested()
+                self._raise_if_error_queue(f"polling pulse list sweep on {active_channel}")
+                active_n = int(
+                    float(
+                        self._query_cmd_checked(
+                            f"print({active_channel}.nvbuffer1.n)",
+                            f"reading pulse list buffer count on {active_channel}",
+                        )
+                    )
+                )
+                current_n = min(active_n, total_points)
+                if measure_bias and bias_channel is not None:
+                    bias_n = int(
+                        float(
+                            self._query_cmd_checked(
+                                f"print({bias_channel}.nvbuffer1.n)",
+                                f"reading pulse list buffer count on {bias_channel}",
+                            )
+                        )
+                    )
+                    current_n = min(current_n, bias_n)
+                if current_n <= old_n:
+                    continue
+                if (
+                    current_n < total_points
+                    and current_n - old_n < self.MIN_CHUNK_POINTS
+                ):
+                    continue
+
+                pull_start = old_n + 1
+                while pull_start <= current_n:
+                    _abort_if_requested()
+                    pull_end = min(
+                        pull_start + self.MAX_POINTS_PER_PRINTBUFFER - 1,
+                        current_n,
+                    )
+                    columns = [
+                        f"{active_channel}.nvbuffer1.readings",
+                        f"{active_channel}.nvbuffer1.timestamps",
+                        f"{active_channel}.nvbuffer2.readings",
+                    ]
+                    bias_current_index: int | None = None
+                    bias_voltage_index: int | None = None
+                    if measure_bias and bias_channel is not None:
+                        bias_current_index = len(columns)
+                        columns.append(f"{bias_channel}.nvbuffer1.readings")
+                        bias_voltage_index = len(columns)
+                        columns.append(f"{bias_channel}.nvbuffer2.readings")
+
+                    reply = self._query_cmd_checked(
+                        f"printbuffer({pull_start}, {pull_end}, {', '.join(columns)})",
+                        f"reading pulse list rows {pull_start}-{pull_end}",
+                    )
+                    rows = self._reshape_printbuffer_rows(reply, len(columns))
+                    if rows:
+                        chunk_levels = levels[pull_start - 1 : pull_start - 1 + len(rows)]
+                        active_currents = [row[0] for row in rows]
+                        active_timestamps = [row[1] for row in rows]
+                        active_voltages = [row[2] for row in rows]
+                        bias_sources = None
+                        bias_currents = None
+                        bias_voltages = None
+                        if (
+                            bias_current_index is not None
+                            and bias_voltage_index is not None
+                        ):
+                            bias_sources = [bias_level] * len(rows)
+                            bias_currents = [row[bias_current_index] for row in rows]
+                            bias_voltages = [row[bias_voltage_index] for row in rows]
+                        yield (
+                            chunk_levels,
+                            active_currents,
+                            active_voltages,
+                            bias_sources,
+                            bias_currents,
+                            bias_voltages,
+                            active_timestamps,
+                        )
+                    pull_start = pull_end + 1
+
+                old_n = current_n
+
+            _abort_if_requested()
+            self._query_cmd_checked(
+                "wait_pulse_done() print(1)",
+                "waiting for pulse list sweep completion",
             )
             self._source_levels[active_channel] = 0.0
             if bias_channel is not None:

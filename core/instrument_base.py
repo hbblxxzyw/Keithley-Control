@@ -215,6 +215,47 @@ class AbstractSMU(ABC):
         pass
 
     @abstractmethod
+    def run_pulse_list_sweep(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        source_levels: list[float],
+        src_to_meas_delay_s: float,
+        nplc: float,
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        bias_config: dict | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """
+        Run a pulse source-list sweep with one measurement per source point.
+
+        Yields chunks in the same shape as run_pulse_timeline:
+        (
+            active_source_levels,
+            active_current_values,
+            active_voltage_values,
+            bias_source_levels,
+            bias_current_values,
+            bias_voltage_values,
+            timestamps,
+        ).
+        """
+        pass
+
+    @abstractmethod
     def run_single_smu_sweep(
         self,
         smu_channel: str,

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +33,31 @@ class PulseTimelinePoint:
     time_s: float
     source_level: float
     dwell_to_next_s: float
+
+
+@dataclass(frozen=True)
+class PulseListSweepSegment:
+    """Quantized source-list metadata for one active or idle pulse segment."""
+
+    event_index: int
+    kind: str
+    level: float
+    duration_s: float
+    point_count: int
+    remainder_s: float
+
+
+@dataclass(frozen=True)
+class PulseListSweepPlan:
+    """NPLC-derived source list for list-sweep pulse acquisition."""
+
+    source_levels: list[float]
+    point_interval_s: float
+    measurement_window_s: float
+    src_to_meas_delay_s: float
+    total_points: int
+    segments: list[PulseListSweepSegment]
+    warnings: list[str]
 
 
 def flatten_pulse_config(
@@ -156,6 +184,139 @@ def build_pulse_timeline(
     return points
 
 
+def build_pulse_list_sweep_plan(
+    events: list[PulseEvent],
+    *,
+    nplc: float,
+    line_frequency_hz: float,
+    src_to_meas_delay_s: float,
+) -> PulseListSweepPlan:
+    """Flatten pulse events into an NPLC-paced source-level list sweep."""
+    try:
+        nplc_value = float(nplc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid NPLC: {nplc!r}") from exc
+    try:
+        line_frequency = float(line_frequency_hz)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid line frequency: {line_frequency_hz!r}") from exc
+    try:
+        src_to_meas_delay = float(src_to_meas_delay_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid source-to-measure delay: {src_to_meas_delay_s!r}"
+        ) from exc
+
+    if nplc_value <= 0.0:
+        raise ValueError("NPLC must be greater than 0.")
+    if line_frequency <= 0.0:
+        raise ValueError("Line frequency must be greater than 0 Hz.")
+
+    measurement_window = nplc_value / line_frequency
+    point_interval = measurement_window + src_to_meas_delay
+    if point_interval <= 0.0:
+        raise ValueError(
+            "Point interval must be greater than 0 s for the current NPLC, "
+            "line frequency, and source-to-measure delay."
+        )
+    if not events:
+        raise ValueError("Pulse sequence is empty.")
+
+    source_levels: list[float] = []
+    segments: list[PulseListSweepSegment] = []
+    warnings: list[str] = []
+
+    for index, event in enumerate(events, start=1):
+        width = float(event.width_s)
+        interval_after = float(event.interval_after_s)
+        if width <= 0.0:
+            raise ValueError(f"Pulse {index} width must be greater than 0 s.")
+        if interval_after < 0.0:
+            raise ValueError(f"Pulse {index} interval_after_s must be >= 0 s.")
+
+        active_count = _floor_interval_count(width, point_interval)
+        if active_count < 1:
+            raise ValueError(
+                f"Pulse {index} width is too short for the current NPLC + "
+                "source-to-measure delay."
+            )
+
+        active_remainder = _quantization_remainder(width, active_count, point_interval)
+        source_levels.extend([float(event.level)] * active_count)
+        segments.append(
+            PulseListSweepSegment(
+                event_index=index,
+                kind="active",
+                level=float(event.level),
+                duration_s=width,
+                point_count=active_count,
+                remainder_s=active_remainder,
+            )
+        )
+        _append_remainder_warning(
+            warnings,
+            index=index,
+            kind="active",
+            remainder_s=active_remainder,
+        )
+
+        idle_count = _floor_interval_count(interval_after, point_interval)
+        idle_remainder = _quantization_remainder(
+            interval_after,
+            idle_count,
+            point_interval,
+        )
+        source_levels.extend([0.0] * idle_count)
+        segments.append(
+            PulseListSweepSegment(
+                event_index=index,
+                kind="idle",
+                level=0.0,
+                duration_s=interval_after,
+                point_count=idle_count,
+                remainder_s=idle_remainder,
+            )
+        )
+        _append_remainder_warning(
+            warnings,
+            index=index,
+            kind="idle",
+            remainder_s=idle_remainder,
+        )
+
+    return PulseListSweepPlan(
+        source_levels=source_levels,
+        point_interval_s=point_interval,
+        measurement_window_s=measurement_window,
+        src_to_meas_delay_s=src_to_meas_delay,
+        total_points=len(source_levels),
+        segments=segments,
+        warnings=warnings,
+    )
+
+
+def pulse_source_levels_to_csv_rows(source_levels: list[float]) -> list[list[float]]:
+    """Return source levels as single-column CSV rows."""
+    return [[float(level)] for level in source_levels]
+
+
+def pulse_source_levels_to_csv_string(source_levels: list[float]) -> str:
+    """Return source levels as a single-column CSV string."""
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerows(pulse_source_levels_to_csv_rows(source_levels))
+    return output.getvalue()
+
+
+def pulse_list_sweep_levels_to_csv(source_levels: list[float]) -> str:
+    """Return time-less pulse list-sweep source levels with a ``level`` header."""
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(["level"])
+    writer.writerows(pulse_source_levels_to_csv_rows(source_levels))
+    return output.getvalue()
+
+
 def validate_pulse_timeline(points: list[PulseTimelinePoint]) -> None:
     """Validate timed-list delays for Keithley 2600B trigger.timer.delaylist."""
     if not points:
@@ -231,6 +392,32 @@ def _float_value(value: Any, label: str) -> float:
 
 def _average(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _quantization_remainder(
+    duration_s: float,
+    point_count: int,
+    point_interval_s: float,
+) -> float:
+    return _round_time(max(0.0, duration_s - point_count * point_interval_s))
+
+
+def _floor_interval_count(duration_s: float, point_interval_s: float) -> int:
+    return math.floor((duration_s + 1e-12) / point_interval_s)
+
+
+def _append_remainder_warning(
+    warnings: list[str],
+    *,
+    index: int,
+    kind: str,
+    remainder_s: float,
+) -> None:
+    if remainder_s > 1e-12:
+        warnings.append(
+            f"Pulse {index} {kind} segment has {remainder_s:g} s remainder "
+            "not represented after NPLC point-interval quantization."
+        )
 
 
 def _round_time(value: float) -> float:

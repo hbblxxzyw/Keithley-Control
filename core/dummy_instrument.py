@@ -218,6 +218,105 @@ class DummyKeithley2636(AbstractSMU):
             timestamps,
         )
 
+    def run_pulse_list_sweep(
+        self,
+        smu_channel: str,
+        source_mode: str,
+        source_levels: list[float],
+        src_to_meas_delay_s: float,
+        nplc: float,
+        source_limit: float | None = None,
+        measurement_items: list[str] | None = None,
+        bias_config: dict | None = None,
+        stop_checker: Callable[[], bool] | None = None,
+    ) -> Generator[
+        tuple[
+            list[float],
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float] | None,
+            list[float],
+        ],
+        None,
+        None,
+    ]:
+        """Yield deterministic fake readings for a pulse source-list sweep."""
+        if callable(bias_config) and stop_checker is None:
+            stop_checker = bias_config
+            bias_config = measurement_items if isinstance(measurement_items, dict) else None
+            measurement_items = (
+                list(source_limit)
+                if isinstance(source_limit, list)
+                else None
+            )
+            source_limit = float(nplc) if isinstance(nplc, (int, float)) else None
+            nplc = 1.0
+
+        if not source_levels:
+            return
+        if stop_checker is not None and stop_checker():
+            raise InterruptedError("Pulse run aborted by user.")
+
+        normalized_mode = str(source_mode or "voltage").strip().lower()
+        levels = [float(level) for level in source_levels]
+        linefreq_hz = 60.0
+        point_interval_s = max(float(nplc), 0.0) / linefreq_hz + max(
+            float(src_to_meas_delay_s),
+            0.0,
+        )
+        timestamps = [
+            float(index) * point_interval_s for index in range(len(levels))
+        ]
+
+        if normalized_mode == "current":
+            currents = list(levels)
+            voltages = [
+                0.05 + level * 1.0e5 + index * 1e-4
+                for index, level in enumerate(levels)
+            ]
+        else:
+            voltages = list(levels)
+            currents = [
+                1.23e-6 + level * 1e-7 + index * 1e-9
+                for index, level in enumerate(levels)
+            ]
+
+        bias_sources: list[float] | None = None
+        bias_currents: list[float] | None = None
+        bias_voltages: list[float] | None = None
+        if isinstance(bias_config, dict):
+            bias_level = float(bias_config.get("level", 0.0))
+            bias_mode = str(bias_config.get("source_mode", "voltage")).strip().lower()
+            bias_sources = [bias_level] * len(levels)
+            if bias_mode == "current":
+                bias_currents = list(bias_sources)
+                bias_voltages = [
+                    0.02 + bias_level * 1.0e5 + index * 5e-5
+                    for index in range(len(levels))
+                ]
+            else:
+                bias_voltages = list(bias_sources)
+                bias_currents = [
+                    8.9e-7 + bias_level * 8e-8 + index * 1e-9
+                    for index in range(len(levels))
+                ]
+            channel = str(bias_config.get("channel", "")).strip()
+            if channel:
+                self._source_levels[channel] = bias_level
+
+        self._source_levels[smu_channel] = 0.0
+        yield (
+            levels,
+            currents,
+            voltages,
+            bias_sources,
+            bias_currents,
+            bias_voltages,
+            timestamps,
+        )
+
     def run_iv_sweep(
         self,
         smu_channel: str,

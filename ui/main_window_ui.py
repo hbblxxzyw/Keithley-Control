@@ -356,7 +356,10 @@ class MainWindowUI(QMainWindow):
         ]
 
         self.sweep_points_spin.setEnabled(bool(sweep_modes))
-        self.pulse_sample_interval_spin.setEnabled(bool(pulse_modes))
+        use_list_sweep_sampling = bool(self.pulse_list_sweep_sampling_check.isChecked())
+        self.pulse_sample_interval_spin.setEnabled(
+            bool(pulse_modes) and not use_list_sweep_sampling
+        )
 
         current_stepper = str(self.stepper_selector.currentText() or "").strip()
         allowed_stepper_options = ["None"]
@@ -393,6 +396,7 @@ class MainWindowUI(QMainWindow):
             self.src_meas_delay_spin,
             self.step_sweep_delay_spin,
             self.pulse_sample_interval_spin,
+            self.pulse_list_sweep_sampling_check,
             self.stepper_selector,
             self.sweep_points_spin,
             self.stepper_points_spin,
@@ -434,6 +438,9 @@ class MainWindowUI(QMainWindow):
                 "src_meas_delay": float(self.src_meas_delay_spin.value()),
                 "step_sweep_delay": float(self.step_sweep_delay_spin.value()),
                 "pulse_sample_interval": float(self.pulse_sample_interval_spin.value()),
+                "pulse_list_sweep_sampling": bool(
+                    self.pulse_list_sweep_sampling_check.isChecked()
+                ),
                 "stepper": str(self.stepper_selector.currentText() or "").strip(),
                 "sweep_points": int(self.sweep_points_spin.value()),
                 "stepper_points": int(self.stepper_points_spin.value()),
@@ -575,6 +582,14 @@ class MainWindowUI(QMainWindow):
                     common_cfg.get(
                         "pulse_sample_interval",
                         self.pulse_sample_interval_spin.value(),
+                    )
+                )
+            )
+            self.pulse_list_sweep_sampling_check.setChecked(
+                bool(
+                    common_cfg.get(
+                        "pulse_list_sweep_sampling",
+                        self.pulse_list_sweep_sampling_check.isChecked(),
                     )
                 )
             )
@@ -790,6 +805,24 @@ class MainWindowUI(QMainWindow):
         self.pulse_sample_interval_spin.setSingleStep(0.0001)
         common_layout.addRow("Pulse Sample Interval:", self.pulse_sample_interval_spin)
         self.pulse_sample_interval_spin.valueChanged.connect(self.emit_config_changed)
+
+        self.pulse_list_sweep_sampling_check = QCheckBox(
+            "Use list sweep sampling (NPLC + delay)"
+        )
+        self.pulse_list_sweep_sampling_check.setChecked(False)
+        pulse_list_sweep_tooltip = (
+            "Pulse sample interval is ignored. Point spacing is estimated as NPLC "
+            "integration window + source-to-measure delay."
+        )
+        self.pulse_list_sweep_sampling_check.setToolTip(pulse_list_sweep_tooltip)
+        self.pulse_sample_interval_spin.setToolTip(pulse_list_sweep_tooltip)
+        common_layout.addRow("", self.pulse_list_sweep_sampling_check)
+        self.pulse_list_sweep_sampling_check.stateChanged.connect(
+            self.emit_config_changed
+        )
+        self.pulse_list_sweep_sampling_check.stateChanged.connect(
+            self._refresh_dynamic_ui_state
+        )
 
         self.stepper_selector = QComboBox()
         self.stepper_selector.addItems(["None", "SMU 2", "SMU 1"])
