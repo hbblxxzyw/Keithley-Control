@@ -28,6 +28,10 @@ class DummyKeithley2636(AbstractSMU):
         """No-op."""
         pass
 
+    def is_connected(self, timeout_ms: int = 300) -> bool:
+        """Report the simulator as always reachable."""
+        return True
+
     def get_model(self) -> str:
         """Return the simulated instrument model."""
         return "2636B Simulator"
@@ -261,7 +265,7 @@ class DummyKeithley2636(AbstractSMU):
 
         normalized_mode = str(source_mode or "voltage").strip().lower()
         levels = [float(level) for level in source_levels]
-        linefreq_hz = 60.0
+        linefreq_hz = 50.0
         point_interval_s = max(float(nplc), 0.0) / linefreq_hz + max(
             float(src_to_meas_delay_s),
             0.0,

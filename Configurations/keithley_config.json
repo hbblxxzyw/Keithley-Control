@@ -1,0 +1,99 @@
+{
+  "format": "keithley-gui-config",
+  "version": 1,
+  "settings": {
+    "resource_address": "USB0::0x05E6::0x2636::4399155::INSTR",
+    "active_smu_page": 0,
+    "common": {
+      "nplc": 8.0,
+      "src_meas_delay": 0.01,
+      "step_sweep_delay": 0.0,
+      "pulse_sample_interval": 0.001,
+      "pulse_list_sweep_sampling": true,
+      "stepper": "None",
+      "sweep_points": 10,
+      "stepper_points": 5,
+      "repeat": 1
+    },
+    "smu1": {
+      "enabled": true,
+      "function": "Voltage",
+      "mode": "Pulse",
+      "dual": false,
+      "ramp_up": {
+        "enabled": false,
+        "step": 0.5,
+        "delay": 1.0
+      },
+      "ramp_down": {
+        "enabled": false,
+        "step": 0.5,
+        "delay": 1.0
+      },
+      "level": 0.0,
+      "start": 0.0,
+      "stop": 0.5,
+      "limit": 1e-05,
+      "pulse": {
+        "combinations": [
+          {
+            "name": "LTP +1 V train",
+            "interval_after_s": 0.0,
+            "repeat": 10,
+            "items": [
+              {
+                "type": "single",
+                "magnitude": 1.0,
+                "duration_s": 0.5,
+                "interval_after_s": 0.9
+              }
+            ]
+          }
+        ],
+        "selected_index": 0
+      },
+      "measure": {
+        "items": [
+          "Voltage",
+          "Current",
+          "Resistance"
+        ],
+        "range": "Auto",
+        "autozero": "On"
+      }
+    },
+    "smu2": {
+      "enabled": true,
+      "function": "Voltage",
+      "mode": "Fixed",
+      "dual": false,
+      "ramp_up": {
+        "enabled": false,
+        "step": 0.5,
+        "delay": 1.0
+      },
+      "ramp_down": {
+        "enabled": false,
+        "step": 0.5,
+        "delay": 1.0
+      },
+      "level": 0.1,
+      "start": 0.0,
+      "stop": 0.5,
+      "limit": 1e-05,
+      "pulse": {
+        "combinations": [],
+        "selected_index": -1
+      },
+      "measure": {
+        "items": [
+          "Voltage",
+          "Current",
+          "Resistance"
+        ],
+        "range": "Auto",
+        "autozero": "On"
+      }
+    }
+  }
+}

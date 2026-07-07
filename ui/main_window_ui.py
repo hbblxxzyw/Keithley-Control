@@ -6,7 +6,7 @@ Graph and Table tabs for measurement data.
 """
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QValidator
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_widget import PreviewGraphWidget, MeasurementGraphWidget
+from ui.numeric_spinbox import AdaptiveDelaySpinBox, ScientificDoubleSpinBox
 from ui.pulse_config_dialog import (
     PulseConfigDialog,
     default_pulse_config,
@@ -170,73 +171,6 @@ class MeasurePopupButton(QWidget):
         self.button.setText(
             f"{short_items} | {self.measure_range_combo.currentText()} | {self.measure_autozero_combo.currentText()}"
         )
-
-
-class ScientificDoubleSpinBox(QDoubleSpinBox):
-    """QDoubleSpinBox that accepts scientific notation and displays tiny values as 1E-7."""
-
-    scientific_threshold = 1e-5
-
-    def textFromValue(self, value: float) -> str:
-        abs_value = abs(float(value))
-        if abs_value != 0.0 and abs_value < self.scientific_threshold:
-            return f"{value:.0E}"
-        decimals = max(0, min(self.decimals(), 9))
-        text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
-        return text or "0"
-
-    def valueFromText(self, text: str) -> float:
-        cleaned = text.replace(self.suffix(), "").strip()
-        if not cleaned:
-            return self.minimum()
-        return float(cleaned)
-
-    def validate(self, text: str, pos: int) -> tuple[QValidator.State, str, int]:
-        cleaned = text.replace(self.suffix(), "").strip()
-        if not cleaned or cleaned in {"-", "+", ".", "-.", "+.", "E", "e"}:
-            return (QValidator.State.Intermediate, text, pos)
-        try:
-            float(cleaned)
-        except ValueError:
-            partial_markers = ("e", "e+", "e-", "E", "E+", "E-")
-            if cleaned.endswith(partial_markers):
-                return (QValidator.State.Intermediate, text, pos)
-            return (QValidator.State.Invalid, text, pos)
-        return (QValidator.State.Acceptable, text, pos)
-
-
-class AdaptiveDelaySpinBox(QDoubleSpinBox):
-    """Delay spinbox that stores ns-scale precision but keeps common values tidy."""
-
-    display_decimals = 4
-
-    def textFromValue(self, value: float) -> str:
-        value = float(value)
-        rounded_display_value = round(value, self.display_decimals)
-        precision_tolerance = 0.5 * (10 ** -self.decimals())
-        if abs(value - rounded_display_value) <= precision_tolerance:
-            return f"{rounded_display_value:.{self.display_decimals}f}"
-        text = f"{value:.{self.decimals()}f}".rstrip("0").rstrip(".")
-        return text or "0"
-
-    def valueFromText(self, text: str) -> float:
-        cleaned = text.replace(self.suffix(), "").strip()
-        if not cleaned:
-            return self.minimum()
-        return float(cleaned)
-
-    def validate(self, text: str, pos: int) -> tuple[QValidator.State, str, int]:
-        cleaned = text.replace(self.suffix(), "").strip()
-        if not cleaned or cleaned in {"-", "+", ".", "-.", "+.", "E", "e"}:
-            return (QValidator.State.Intermediate, text, pos)
-        try:
-            float(cleaned)
-        except ValueError:
-            partial_markers = ("e", "e+", "e-", "E", "E+", "E-")
-            if cleaned.endswith(partial_markers):
-                return (QValidator.State.Intermediate, text, pos)
-            return (QValidator.State.Invalid, text, pos)
-        return (QValidator.State.Acceptable, text, pos)
 
 
 class MainWindowUI(QMainWindow):
@@ -909,16 +843,16 @@ class MainWindowUI(QMainWindow):
 
         ramp_up_check = QCheckBox("Ramp Up from 0V")
         ramp_container_layout.addWidget(ramp_up_check)
-        ramp_up_step = QDoubleSpinBox()
+        ramp_up_step = ScientificDoubleSpinBox()
         ramp_up_step.setRange(0.01, 1000.0)
         ramp_up_step.setValue(0.5)
         ramp_up_step.setSuffix(" V")
-        ramp_up_step.setDecimals(3)
-        ramp_up_delay = QDoubleSpinBox()
+        ramp_up_step.setDecimals(9)
+        ramp_up_delay = AdaptiveDelaySpinBox()
         ramp_up_delay.setRange(0.0, 3600.0)
         ramp_up_delay.setValue(1.0)
         ramp_up_delay.setSuffix(" s")
-        ramp_up_delay.setDecimals(2)
+        ramp_up_delay.setDecimals(9)
         ramp_up_row = QWidget()
         ramp_up_hbox = QHBoxLayout(ramp_up_row)
         ramp_up_hbox.setContentsMargins(0, 0, 0, 0)
@@ -928,16 +862,16 @@ class MainWindowUI(QMainWindow):
 
         ramp_down_check = QCheckBox("Ramp Down to 0V")
         ramp_container_layout.addWidget(ramp_down_check)
-        ramp_down_step = QDoubleSpinBox()
+        ramp_down_step = ScientificDoubleSpinBox()
         ramp_down_step.setRange(0.01, 1000.0)
         ramp_down_step.setValue(0.5)
         ramp_down_step.setSuffix(" V")
-        ramp_down_step.setDecimals(3)
-        ramp_down_delay = QDoubleSpinBox()
+        ramp_down_step.setDecimals(9)
+        ramp_down_delay = AdaptiveDelaySpinBox()
         ramp_down_delay.setRange(0.0, 3600.0)
         ramp_down_delay.setValue(1.0)
         ramp_down_delay.setSuffix(" s")
-        ramp_down_delay.setDecimals(2)
+        ramp_down_delay.setDecimals(9)
         ramp_down_row = QWidget()
         ramp_down_hbox = QHBoxLayout(ramp_down_row)
         ramp_down_hbox.setContentsMargins(0, 0, 0, 0)
@@ -947,24 +881,24 @@ class MainWindowUI(QMainWindow):
 
         form.addRow("Ramp:", ramp_container)
 
-        level_spin = QDoubleSpinBox()
+        level_spin = ScientificDoubleSpinBox()
         level_spin.setRange(-1e3, 1e3)
-        level_spin.setDecimals(4)
+        level_spin.setDecimals(9)
         form.addRow("Bias Level:", level_spin)
 
-        start_spin = QDoubleSpinBox()
+        start_spin = ScientificDoubleSpinBox()
         start_spin.setRange(-1e3, 1e3)
-        start_spin.setDecimals(4)
+        start_spin.setDecimals(9)
         form.addRow("Start:", start_spin)
 
-        stop_spin = QDoubleSpinBox()
+        stop_spin = ScientificDoubleSpinBox()
         stop_spin.setRange(-1e3, 1e3)
-        stop_spin.setDecimals(4)
+        stop_spin.setDecimals(9)
         form.addRow("Stop:", stop_spin)
 
-        step_display = QDoubleSpinBox()
+        step_display = ScientificDoubleSpinBox()
         step_display.setRange(0.0, 2000.0)
-        step_display.setDecimals(6)
+        step_display.setDecimals(9)
         step_display.setSingleStep(0.1)
         step_display.setSuffix(" V")
         step_display.setKeyboardTracking(False)

@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -35,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_widget import PlainAxisItem
+from ui.numeric_spinbox import AdaptiveDelaySpinBox, ScientificDoubleSpinBox
 
 
 PULSE_TYPE_LABELS = {
@@ -471,7 +471,7 @@ class PulseSequenceEditor(QWidget):
         form.addRow("Type:", self.type_combo)
 
         self.magnitude_label = QLabel("Magnitude:")
-        self.magnitude_spin = QDoubleSpinBox()
+        self.magnitude_spin = ScientificDoubleSpinBox()
         self.magnitude_spin.setRange(-1e6, 1e6)
         self.magnitude_spin.setDecimals(9)
         self.magnitude_spin.setSingleStep(0.1)
@@ -479,7 +479,7 @@ class PulseSequenceEditor(QWidget):
         form.addRow(self.magnitude_label, self.magnitude_spin)
 
         self.duration_label = QLabel("Duration:")
-        self.duration_spin = QDoubleSpinBox()
+        self.duration_spin = AdaptiveDelaySpinBox()
         self.duration_spin.setRange(0.0, 3600.0)
         self.duration_spin.setDecimals(9)
         self.duration_spin.setSingleStep(0.001)
@@ -488,7 +488,7 @@ class PulseSequenceEditor(QWidget):
         form.addRow(self.duration_label, self.duration_spin)
 
         self.interval_label = QLabel("Interval:")
-        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin = AdaptiveDelaySpinBox()
         self.interval_spin.setRange(0.0, 3600.0)
         self.interval_spin.setDecimals(9)
         self.interval_spin.setSingleStep(0.001)
@@ -497,7 +497,7 @@ class PulseSequenceEditor(QWidget):
         form.addRow(self.interval_label, self.interval_spin)
 
         self.interval_after_label = QLabel("Interval After:")
-        self.interval_after_spin = QDoubleSpinBox()
+        self.interval_after_spin = AdaptiveDelaySpinBox()
         self.interval_after_spin.setRange(0.0, 3600.0)
         self.interval_after_spin.setDecimals(9)
         self.interval_after_spin.setSingleStep(0.001)
@@ -901,9 +901,9 @@ class PulseConfigDialog(QDialog):
         interval_repeat_row = QWidget()
         interval_repeat_layout = QHBoxLayout(interval_repeat_row)
         interval_repeat_layout.setContentsMargins(0, 0, 0, 0)
-        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin = AdaptiveDelaySpinBox()
         self.interval_spin.setRange(0.0, 3600.0)
-        self.interval_spin.setDecimals(6)
+        self.interval_spin.setDecimals(9)
         self.interval_spin.setSingleStep(0.001)
         self.interval_spin.setSuffix(" s")
         self.interval_spin.valueChanged.connect(self._handle_interval_changed)

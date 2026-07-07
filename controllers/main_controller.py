@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
 from PySide6.QtCore import QThread, QTimer, Signal
-from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem
 
 from core.instrument_base import AbstractSMU
 from core.pulse_sequence import (
@@ -573,14 +573,15 @@ class PulseWorker(QThread):
                         "sweep sampling."
                     )
                 pulse_chunks = runner(
-                    channel,
-                    source_mode,
-                    source_levels,
-                    src_to_meas_delay_s,
-                    source_limit,
-                    list(measure_cfg.get("items", [])),
-                    bias_cfg,
-                    abort_if_requested,
+                    smu_channel=channel,
+                    source_mode=source_mode,
+                    source_levels=source_levels,
+                    src_to_meas_delay_s=src_to_meas_delay_s,
+                    nplc=nplc,
+                    source_limit=source_limit,
+                    measurement_items=list(measure_cfg.get("items", [])),
+                    bias_config=bias_cfg,
+                    stop_checker=abort_if_requested,
                 )
             else:
                 pulse_chunks = self.instrument.run_pulse_timeline(
@@ -697,6 +698,7 @@ class MainController:
         self.ui = ui
         self.instrument = instrument
         self._connected = False
+        self._connecting = False
         self._autoscale_after_first_point = False
         self._syncing_step_controls = False
         self.bind_signals()
@@ -790,28 +792,7 @@ class MainController:
         return self.ui.sweep_points_spin
 
     def _line_frequency_hz(self) -> float:
-        getter = getattr(self.instrument, "get_line_frequency_hz", None)
-        if callable(getter):
-            try:
-                value = float(getter())
-            except Exception as exc:
-                print(
-                    "Warning: failed to read instrument line frequency; "
-                    f"falling back to 60.0 Hz. ({exc})"
-                )
-            else:
-                if value > 0.0:
-                    return value
-                print(
-                    "Warning: instrument returned invalid line frequency; "
-                    "falling back to 60.0 Hz."
-                )
-        else:
-            print(
-                "Warning: instrument line frequency is unavailable; "
-                "falling back to 60.0 Hz."
-            )
-        return 60.0
+        return 50.0
 
     def _set_step_control_value(
         self,
@@ -873,8 +854,50 @@ class MainController:
         self.ui.run_btn.setEnabled(False)
         self._connected = False
 
+    def _set_connecting_status(self, text: str = "Connecting...") -> None:
+        self.ui.connection_status_label.setText(text)
+        self.ui.connection_status_label.setStyleSheet(
+            "color: #9a6b00; font-weight: bold;"
+        )
+        self.ui.run_btn.setEnabled(False)
+
+    def _worker_is_running(self) -> bool:
+        worker = getattr(self, "worker", None)
+        is_running = getattr(worker, "isRunning", None)
+        return bool(callable(is_running) and is_running())
+
+    def _instrument_is_connected(self) -> bool:
+        checker = getattr(self.instrument, "is_connected", None)
+        if not callable(checker):
+            return self._connected
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _handle_connection_lost(self) -> None:
+        try:
+            self.instrument.disconnect()
+        except Exception:
+            pass
+        self._set_disconnected_status("Disconnected")
+
     def _connect_resource(self, resource_str: str, *, quiet_failure: bool = False) -> bool:
-        ok = self.instrument.connect(resource_str)
+        if self._connecting:
+            return False
+
+        self._connecting = True
+        self.ui.connect_btn.setEnabled(False)
+        if not quiet_failure:
+            self._set_connecting_status()
+            QApplication.processEvents()
+
+        try:
+            ok = self.instrument.connect(resource_str)
+        finally:
+            self._connecting = False
+            self.ui.connect_btn.setEnabled(True)
+
         if ok:
             model_getter = getattr(self.instrument, "get_model", None)
             model_name = model_getter() if callable(model_getter) else None
@@ -882,9 +905,6 @@ class MainController:
             if callable(set_model):
                 set_model(model_name)
             self._set_connected_status(model_name)
-            timer = getattr(self, "_auto_connect_timer", None)
-            if timer is not None:
-                timer.stop()
             return True
 
         if quiet_failure:
@@ -899,11 +919,13 @@ class MainController:
         return False
 
     def try_auto_connect(self) -> None:
-        """Periodically scan for a Keithley and connect silently when found."""
+        """Monitor the current session and silently reconnect when possible."""
+        if self._connecting or self._worker_is_running():
+            return
+
         if self._connected:
-            timer = getattr(self, "_auto_connect_timer", None)
-            if timer is not None:
-                timer.stop()
+            if not self._instrument_is_connected():
+                self._handle_connection_lost()
             return
 
         finder = getattr(self.instrument, "find_resource_address", None)

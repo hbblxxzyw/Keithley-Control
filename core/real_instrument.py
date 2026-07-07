@@ -43,13 +43,14 @@ class RealKeithley2636(AbstractSMU):
     DEFAULT_RESOURCE_ENCODING = "latin-1"
     DUAL_SYNC_SCRIPT_NAME = "oai_dualsync"
     PULSE_SCRIPT_NAME = "oai_pulse"
-    TSP_TABLE_CHUNK_SIZE = 25
+    TSP_TABLE_CHUNK_SIZE = 14
     TSP_FINAL_ENDPULSE_DELAY_S = 5e-7
 
     def __init__(self, debug: bool = False) -> None:
         self.debug = debug
         self._rm = None if debug else self._create_resource_manager()
         self._resource = None
+        self._resource_address: str | None = None
         self._current_limits: dict[str, float] = {}
         self._source_levels: dict[str, float] = {"smua": 0.0, "smub": 0.0}
         self._source_limits: dict[str, float | None] = {"smua": None, "smub": None}
@@ -88,6 +89,27 @@ class RealKeithley2636(AbstractSMU):
             "or run with the dummy instrument for GUI development. "
             f"Tried {details}"
         )
+
+    def _recreate_resource_manager(self) -> None:
+        close = getattr(self._rm, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        self._rm = None
+        self._rm = self._create_resource_manager()
+
+    def _close_resource_quietly(self) -> None:
+        resource = self._resource
+        self._resource = None
+        self._resource_address = None
+        if resource is None:
+            return
+        try:
+            resource.close()
+        except Exception:
+            pass
 
     @classmethod
     def visa_available(cls) -> tuple[bool, str | None]:
@@ -646,10 +668,11 @@ end
             self._send_cmd(f"{name} = {{}}")
             for start in range(0, len(values), self.TSP_TABLE_CHUNK_SIZE):
                 chunk = values[start : start + self.TSP_TABLE_CHUNK_SIZE]
-                for value in chunk:
-                    self._send_cmd(
-                        f"table.insert({name}, {self._format_tsp_value(float(value))})"
-                    )
+                insert_commands = [
+                    f"table.insert({name}, {self._format_tsp_value(float(value))})"
+                    for value in chunk
+                ]
+                self._send_cmd(" ".join(insert_commands))
             self._raise_if_error_queue(f"loading TSP table {name}")
 
     def connect(self, resource_str: str) -> bool:
@@ -657,13 +680,33 @@ end
             print(f"[DEBUG] Virtual connection OK: {resource_str}")
             return True
         if self._rm is None:
+            try:
+                self._rm = self._create_resource_manager()
+            except Exception as exc:
+                print(f"Connection error: {exc}")
+                return False
+        self._close_resource_quietly()
+
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                if attempt > 0:
+                    self._recreate_resource_manager()
+                self._resource = self._rm.open_resource(resource_str)
+                break
+            except Exception as exc:
+                last_error = exc
+                self._close_resource_quietly()
+        else:
+            print(f"Connection error: {last_error}")
             return False
+
         try:
-            self._resource = self._rm.open_resource(resource_str)
             self._resource.timeout = self.DEFAULT_TIMEOUT_MS
             self._resource.encoding = self.DEFAULT_RESOURCE_ENCODING
             self._resource.read_termination = "\n"
             self._resource.write_termination = "\n"
+            self._resource_address = resource_str
 
             if "ASRL" in resource_str.upper() or "COM" in resource_str.upper():
                 self._resource.baud_rate = 57600
@@ -673,6 +716,7 @@ end
             self._pulse_script_loaded = False
             return True
         except Exception as exc:
+            self._close_resource_quietly()
             print(f"Connection error: {exc}")
             return False
 
@@ -680,12 +724,41 @@ end
         if self.debug:
             print("[DEBUG] Virtual disconnect")
             return
-        if self._resource is not None:
-            self._resource.close()
-            self._resource = None
+        self._close_resource_quietly()
         self._instrument_model = None
         self._dual_sync_script_loaded = False
         self._pulse_script_loaded = False
+
+    def is_connected(self, timeout_ms: int = 300) -> bool:
+        if self.debug:
+            return True
+        if self._resource is None:
+            return False
+
+        if self._resource_address:
+            resources: list[str] | None
+            try:
+                resources = list(self._rm.list_resources()) if self._rm is not None else []
+            except Exception:
+                resources = None
+            if resources is not None and self._resource_address not in resources:
+                return False
+
+        with self._io_lock:
+            original_timeout = getattr(self._resource, "timeout", None)
+            try:
+                self._resource.timeout = max(50, int(timeout_ms))
+                self._resource.write("print(1)")
+                reply = self._read_response().strip()
+                return abs(float(reply) - 1.0) < 1e-12
+            except Exception:
+                return False
+            finally:
+                if original_timeout is not None and self._resource is not None:
+                    try:
+                        self._resource.timeout = original_timeout
+                    except Exception:
+                        pass
 
     def get_model(self) -> str | None:
         if self.debug:
@@ -709,11 +782,18 @@ end
 
     def find_resource_address(self, preferred_serial: str | None = None) -> str | None:
         if self._rm is None:
-            return None
+            try:
+                self._rm = self._create_resource_manager()
+            except Exception:
+                return None
         try:
             resources = list(self._rm.list_resources())
         except Exception:
-            return None
+            try:
+                self._recreate_resource_manager()
+                resources = list(self._rm.list_resources())
+            except Exception:
+                return None
 
         if preferred_serial:
             for resource in resources:
@@ -1046,6 +1126,8 @@ function configure_pulse_list_sweep(cn, on, smode, levels, n, dt, lim, bmode, bl
         b.abort()
     end
     trigger.blender[1].reset()
+    trigger.blender[2].reset()
+    trigger.blender[3].reset()
     trigger.timer[1].reset()
 
     _pulse_pb(c)
@@ -1055,6 +1137,7 @@ function configure_pulse_list_sweep(cn, on, smode, levels, n, dt, lim, bmode, bl
 
     if smode == 1 then
         c.source.func = c.OUTPUT_DCAMPS
+        c.source.offmode = c.OUTPUT_NORMAL
         if lim ~= nil and lim > 0 then
             c.source.limitv = lim
         end
@@ -1062,6 +1145,10 @@ function configure_pulse_list_sweep(cn, on, smode, levels, n, dt, lim, bmode, bl
         c.trigger.source.listi(levels)
     else
         c.source.func = c.OUTPUT_DCVOLTS
+        c.source.autorangev = c.AUTORANGE_ON
+        c.trigger.source.limiti = 0
+        c.source.highc = c.DISABLE
+        c.source.offmode = c.OUTPUT_NORMAL
         if lim ~= nil and lim > 0 then
             c.source.limiti = lim
         end
@@ -1081,42 +1168,64 @@ function configure_pulse_list_sweep(cn, on, smode, levels, n, dt, lim, bmode, bl
     trigger.timer[1].delay = dt
     trigger.timer[1].count = 1
     trigger.timer[1].passthrough = false
-    trigger.timer[1].stimulus = c.trigger.SOURCE_COMPLETE_EVENT_ID
-    c.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
+    trigger.timer[1].stimulus = trigger.blender[1].EVENT_ID
 
     trigger.blender[1].orenable = true
     trigger.blender[1].stimulus[1] = c.trigger.ARMED_EVENT_ID
-    trigger.blender[1].stimulus[2] = c.trigger.PULSE_COMPLETE_EVENT_ID
+    trigger.blender[1].stimulus[2] = trigger.blender[3].EVENT_ID
     c.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+
+    trigger.blender[2].orenable = false
+    trigger.blender[2].stimulus[1] = c.trigger.SOURCE_COMPLETE_EVENT_ID
+    trigger.blender[2].stimulus[3] = trigger.timer[1].EVENT_ID
+    c.trigger.measure.stimulus = trigger.blender[2].EVENT_ID
+
+    trigger.blender[3].orenable = false
+    trigger.blender[3].stimulus[1] = c.trigger.PULSE_COMPLETE_EVENT_ID
 
     c.trigger.endpulse.action = c.SOURCE_HOLD
     c.trigger.endpulse.stimulus = c.trigger.MEASURE_COMPLETE_EVENT_ID
-    c.trigger.endsweep.action = c.SOURCE_IDLE
+    c.trigger.endsweep.action = c.SOURCE_HOLD
 
     if b ~= nil then
         if bmode == 1 then
             b.source.func = b.OUTPUT_DCAMPS
+            b.source.offmode = b.OUTPUT_NORMAL
             if blim ~= nil and blim > 0 then
                 b.source.limitv = blim
             end
             b.source.leveli = blev
+            b.trigger.source.lineari(blev, blev, 10)
         else
             b.source.func = b.OUTPUT_DCVOLTS
+            if math.abs(blev) <= 0.2 then
+                b.source.autorangev = b.AUTORANGE_OFF
+                b.source.rangev = 0.2
+            else
+                b.source.autorangev = b.AUTORANGE_ON
+            end
+            b.trigger.source.limiti = 0
+            b.source.highc = b.DISABLE
+            b.source.offmode = b.OUTPUT_NORMAL
             if blim ~= nil and blim > 0 then
                 b.source.limiti = blim
             end
             b.source.levelv = blev
+            b.trigger.source.linearv(blev, blev, 10)
         end
         b.source.delay = 0
         b.measure.delay = 0
-        b.trigger.source.action = b.DISABLE
+        b.trigger.source.action = b.ENABLE
+        b.trigger.count = n
+        b.trigger.arm.count = 1
+        b.trigger.arm.stimulus = 0
+        b.trigger.source.stimulus = trigger.blender[1].EVENT_ID
+        trigger.blender[2].stimulus[2] = b.trigger.SOURCE_COMPLETE_EVENT_ID
+        trigger.blender[3].stimulus[2] = b.trigger.PULSE_COMPLETE_EVENT_ID
         if measure_bias ~= 0 then
             b.trigger.measure.iv(b.nvbuffer1, b.nvbuffer2)
             b.trigger.measure.action = b.ENABLE
-            b.trigger.count = n
-            b.trigger.arm.count = 1
-            b.trigger.arm.stimulus = 0
-            b.trigger.measure.stimulus = trigger.timer[1].EVENT_ID
+            b.trigger.measure.stimulus = trigger.blender[2].EVENT_ID
             b.trigger.endpulse.action = b.SOURCE_HOLD
             b.trigger.endpulse.stimulus = b.trigger.MEASURE_COMPLETE_EVENT_ID
             b.trigger.endsweep.action = b.SOURCE_HOLD
@@ -1126,7 +1235,7 @@ function configure_pulse_list_sweep(cn, on, smode, levels, n, dt, lim, bmode, bl
         b.source.output = b.OUTPUT_ON
     end
 
-    if b ~= nil and measure_bias ~= 0 then
+    if b ~= nil then
         b.trigger.initiate()
     end
     c.source.output = c.OUTPUT_ON
@@ -1756,8 +1865,40 @@ end
                     f"setting pulse list sweep NPLC on {channel}",
                 )
                 self._send_cmd_checked(
+                    f"{channel}.measure.autozero = {channel}.AUTOZERO_OFF",
+                    f"disabling pulse list sweep autozero on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.interval = 0",
+                    f"setting pulse list sweep measure interval on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.delay = 0",
+                    f"setting pulse list sweep measure delay on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.count = 1",
+                    f"setting pulse list sweep measure count on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.rel.leveli = 0",
+                    f"setting pulse list sweep relative current level on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.filter.count = 10",
+                    f"setting pulse list sweep filter count on {channel}",
+                )
+                self._send_cmd_checked(
                     f"{channel}.measure.filter.enable = {channel}.FILTER_OFF",
                     f"disabling pulse list sweep filter on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.measure.lowrangei = 1E-10",
+                    f"setting pulse list sweep low current range on {channel}",
+                )
+                self._send_cmd_checked(
+                    f"{channel}.sense = {channel}.SENSE_LOCAL",
+                    f"setting pulse list sweep local sense on {channel}",
                 )
                 self._apply_current_measure_range(channel)
 
@@ -1770,7 +1911,7 @@ end
                 list[float] | None,
                 list[float],
             ]:
-                point_interval_s = effective_nplc / 60.0 + delay_s
+                point_interval_s = effective_nplc / 50.0 + delay_s
                 timestamps = [
                     float(index) * point_interval_s for index in range(len(levels))
                 ]
