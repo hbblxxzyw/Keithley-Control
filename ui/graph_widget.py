@@ -317,6 +317,7 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self._display_mode = "linear"
         self._x_axis = "SMU1 Voltage"
         self._y_axis = "SMU1 Current"
+        self._show_ramping = True
         self._hover_distance_px = 10.0
         self._hover_proxy = pg.SignalProxy(
             self.scene().sigMouseMoved,
@@ -345,7 +346,14 @@ class MeasurementGraphWidget(pg.PlotWidget):
     def append_payload(self, payload: dict) -> None:
         """Append one raw measurement payload and redraw the selected axes."""
         self._payloads.append(payload)
-        self._append_payload_for_current_axes(payload)
+        if self._payload_is_visible(payload):
+            self._append_payload_for_current_axes(payload)
+
+    def set_payloads(self, payloads: list[dict]) -> None:
+        """Replace raw payloads and redraw the selected axes."""
+        self._payloads = [dict(payload) for payload in payloads if isinstance(payload, dict)]
+        self._redraw_from_payloads()
+        self.autoscale()
 
     def set_axes(self, x_axis: str, y_axis: str) -> None:
         """Change graph axes and redraw already-acquired payloads."""
@@ -356,10 +364,26 @@ class MeasurementGraphWidget(pg.PlotWidget):
         self._update_axis_labels()
         self._redraw_from_payloads()
 
+    def set_show_ramping(self, show_ramping: bool) -> None:
+        """Control whether ramp-up/down payloads are plotted."""
+        self._show_ramping = bool(show_ramping)
+        self._redraw_from_payloads()
+        self.autoscale()
+
     def _redraw_from_payloads(self) -> None:
         self._clear_curves_only()
         for payload in self._payloads:
+            if not self._payload_is_visible(payload):
+                continue
             self._append_payload_for_current_axes(payload)
+
+    def _payload_is_visible(self, payload: dict) -> bool:
+        if self._show_ramping:
+            return True
+        phase = str(payload.get("sweep_phase", "")).strip().lower()
+        return phase not in {"ramp_up", "ramp_down"} and not bool(
+            payload.get("is_ramp", False)
+        )
 
     def _append_payload_for_current_axes(self, payload: dict) -> None:
         x_val = self._axis_value(payload, self._x_axis)

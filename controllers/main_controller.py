@@ -4,13 +4,22 @@ Main controller: connects MainWindowUI and AbstractSMU, binds signals and slots.
 
 import csv
 import json
+import math
 import time
 import traceback
 from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
 from PySide6.QtCore import QThread, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QInputDialog,
+    QLineEdit,
+    QMessageBox,
+    QTableWidgetItem,
+)
 
 from core.instrument_base import AbstractSMU
 from core.pulse_sequence import (
@@ -20,6 +29,13 @@ from core.pulse_sequence import (
     flatten_pulse_config,
     pulse_list_sweep_levels_to_csv,
 )
+from models.project import (
+    MAX_QUICK_CONFIG_NAME_LENGTH,
+    RunRecord,
+    WorkspaceDocument,
+    clone_json,
+)
+from models.run_data_cache import RunCacheKey, RunDataCache
 
 if TYPE_CHECKING:
     from ui.main_window_ui import MainWindowUI
@@ -133,6 +149,7 @@ class SweepWorker(QThread):
             primary_values: dict[str, float],
             secondary_values: dict[str, float],
             sample_timestamp: float | None = None,
+            sweep_phase: str = "sweep",
         ) -> dict[str, object]:
             smu1_values = primary_values if primary_channel == "smua" else secondary_values
             smu2_values = primary_values if primary_channel == "smub" else secondary_values
@@ -146,6 +163,8 @@ class SweepWorker(QThread):
                 "series_name": series_name,
                 "primary_name": primary_name,
                 "stepper_name": stepper_name,
+                "sweep_phase": sweep_phase,
+                "is_ramp": sweep_phase in {"ramp_up", "ramp_down"},
                 "smu1": {
                     "source_v": primary_setpoint if primary_channel == "smua" else secondary_setpoint,
                     "values": smu1_values,
@@ -166,6 +185,7 @@ class SweepWorker(QThread):
             current_values: list[float],
             measured_voltage_values: list[float] | None,
             timestamp_values: list[float],
+            phase_values: list[str],
         ) -> int:
             primary_points = build_channel_values(
                 list(measure_cfg[primary_channel]["items"]),
@@ -185,6 +205,7 @@ class SweepWorker(QThread):
                     primary_values,
                     {},
                     float(timestamp_values[index]) if index < len(timestamp_values) else None,
+                    phase_values[index] if index < len(phase_values) else "sweep",
                 )
                 self.data_ready.emit(payload)
                 emitted_points += 1
@@ -200,6 +221,7 @@ class SweepWorker(QThread):
             secondary_current_values: list[float],
             secondary_voltage_values: list[float] | None,
             timestamp_values: list[float],
+            phase_values: list[str],
         ) -> int:
             primary_points = build_channel_values(
                 list(measure_cfg[primary_channel]["items"]),
@@ -228,10 +250,49 @@ class SweepWorker(QThread):
                     primary_values,
                     secondary_values,
                     float(timestamp_values[index]) if index < len(timestamp_values) else None,
+                    phase_values[index] if index < len(phase_values) else "sweep",
                 )
                 self.data_ready.emit(payload)
                 emitted_points += 1
             return emitted_points
+
+        def ramp_point_count(enabled: bool, endpoint_v: float, step_v: float) -> int:
+            if not enabled or abs(endpoint_v) <= 0.0:
+                return 0
+            return max(2, int(math.ceil(abs(endpoint_v) / max(step_v, 1e-9))) + 1)
+
+        def build_phase_tracker(
+            sweep_start: float,
+            sweep_stop: float,
+            sweep_points: int,
+            use_ramp_up: bool,
+            use_ramp_down: bool,
+        ):
+            segments: list[tuple[str, int]] = []
+            ramp_up_points = ramp_point_count(use_ramp_up, sweep_start, ru_step)
+            if ramp_up_points > 0:
+                segments.append(("ramp_up", ramp_up_points))
+            segments.append(("sweep", max(0, int(sweep_points))))
+            ramp_down_points = ramp_point_count(use_ramp_down, sweep_stop, rd_step)
+            if ramp_down_points > 0:
+                segments.append(("ramp_down", ramp_down_points))
+
+            segment_index = 0
+            emitted_in_segment = 0
+
+            def next_phases(point_count: int) -> list[str]:
+                nonlocal segment_index, emitted_in_segment
+                phases: list[str] = []
+                for _ in range(max(0, int(point_count))):
+                    while segment_index < len(segments) and emitted_in_segment >= segments[segment_index][1]:
+                        segment_index += 1
+                        emitted_in_segment = 0
+                    phase = segments[segment_index][0] if segment_index < len(segments) else "sweep"
+                    phases.append(phase)
+                    emitted_in_segment += 1
+                return phases
+
+            return next_phases
 
         def stream_iv_pass(
             started_at: float,
@@ -244,6 +305,13 @@ class SweepWorker(QThread):
             use_ramp_down: bool,
         ) -> int:
             emitted_points = 0
+            next_phases = build_phase_tracker(
+                sweep_start,
+                sweep_stop,
+                sweep_points,
+                use_ramp_up,
+                use_ramp_down,
+            )
             abort_if_requested()
             if single_smu:
                 for (
@@ -269,13 +337,15 @@ class SweepWorker(QThread):
                     abort_if_requested,
                 ):
                     abort_if_requested()
+                    source_values = list(source_chunk)
                     emitted_points += emit_single_chunk_payloads(
                         started_at,
                         series_name,
-                        list(source_chunk),
+                        source_values,
                         list(current_chunk),
                         None if voltage_chunk is None else list(voltage_chunk),
                         list(timestamp_chunk),
+                        next_phases(len(source_values)),
                     )
                 return emitted_points
 
@@ -310,16 +380,18 @@ class SweepWorker(QThread):
                 abort_if_requested,
             ):
                 abort_if_requested()
+                primary_source_values = list(primary_source_chunk)
                 emitted_points += emit_chunk_payloads(
                     started_at,
                     series_name,
-                    list(primary_source_chunk),
+                    primary_source_values,
                     list(primary_current_chunk),
                     None if primary_voltage_chunk is None else list(primary_voltage_chunk),
                     list(secondary_source_chunk),
                     list(secondary_current_chunk),
                     None if secondary_voltage_chunk is None else list(secondary_voltage_chunk),
                     list(timestamp_chunk),
+                    next_phases(len(primary_source_values)),
                 )
             return emitted_points
 
@@ -697,11 +769,21 @@ class MainController:
     def __init__(self, ui: "MainWindowUI", instrument: AbstractSMU) -> None:
         self.ui = ui
         self.instrument = instrument
+        self.workspace = WorkspaceDocument.new(ui.collect_settings())
         self._connected = False
         self._connecting = False
         self._autoscale_after_first_point = False
         self._syncing_step_controls = False
+        self._current_run_id: int | None = None
+        self._run_failed = False
+        self._run_aborted = False
+        self._suppress_project_default_update = False
+        self._active_run_view_key: RunCacheKey | None = None
+        self._rendered_graph_key: RunCacheKey | None = None
+        self._rendered_table_key: RunCacheKey | None = None
+        self._run_data_cache = RunDataCache()
         self.bind_signals()
+        self.refresh_project_ui()
         self.update_preview_and_summary()
         self._auto_connect_timer = QTimer(self.ui)
         self._auto_connect_timer.setInterval(1000)
@@ -711,6 +793,24 @@ class MainController:
 
     def bind_signals(self) -> None:
         """Bind UI signals: channel_config_changed and smu_selector change -> update summary and preview."""
+        self.ui.new_project_btn.clicked.connect(self.handle_new_project)
+        self.ui.open_project_btn.clicked.connect(self.handle_open_project)
+        self.ui.save_project_btn.clicked.connect(self.handle_save_project)
+        self.ui.save_project_as_btn.clicked.connect(self.handle_save_project_as)
+        self.ui.new_project_record_btn.clicked.connect(self.handle_new_project_record)
+        self.ui.save_quick_config_btn.clicked.connect(self.handle_save_quick_config)
+        self.ui.project_selected.connect(self.handle_project_selected)
+        self.ui.project_rename_requested.connect(self.handle_rename_project)
+        self.ui.project_delete_requested.connect(self.handle_delete_project)
+        self.ui.run_selected.connect(self.handle_run_selected)
+        self.ui.run_rename_requested.connect(self.handle_rename_run)
+        self.ui.run_delete_requested.connect(self.handle_delete_run)
+        self.ui.quick_config_clicked.connect(self.handle_quick_config_clicked)
+        self.ui.quick_config_rename_requested.connect(self.handle_rename_quick_config)
+        self.ui.quick_config_delete_requested.connect(self.handle_delete_quick_config)
+        self.ui.quick_config_quick_access_toggled.connect(
+            self.handle_quick_config_quick_access_toggled
+        )
         self.ui.scan_btn.clicked.connect(self.handle_scan)
         self.ui.connect_btn.clicked.connect(self.handle_connect)
         self.ui.import_config_btn.clicked.connect(self.handle_import_config)
@@ -728,15 +828,557 @@ class MainController:
         )
         self.ui.x_axis_combo.currentTextChanged.connect(self.handle_graph_axis_change)
         self.ui.y_axis_combo.currentTextChanged.connect(self.handle_graph_axis_change)
+        self.ui.graph_show_ramping_check.stateChanged.connect(
+            self.handle_graph_ramping_visibility_change
+        )
+        self.ui.csv_show_ramping_check.stateChanged.connect(
+            self.handle_table_ramping_visibility_change
+        )
         self.ui.export_csv_btn.clicked.connect(self.handle_export_csv)
         self.ui.channel_config_changed.connect(self.update_preview_and_summary)
+        self.ui.channel_config_changed.connect(self.handle_project_default_settings_changed)
+        self.ui.channel_config_changed.connect(self.handle_ramping_filter_availability_change)
         self.ui.smu_selector.currentIndexChanged.connect(self.update_preview_and_summary)
+        self.ui.tab_widget.currentChanged.connect(self.handle_run_view_tab_changed)
         self.ui.step_display_smu1.valueChanged.connect(
             lambda value: self.handle_step_value_changed(1, value)
         )
         self.ui.step_display_smu2.valueChanged.connect(
             lambda value: self.handle_step_value_changed(2, value)
         )
+
+    def refresh_project_ui(self) -> None:
+        """Refresh workspace title, project tree, and quick config buttons."""
+        path_text = str(self.workspace.path) if self.workspace.path is not None else None
+        active_project = self.workspace.active_project()
+        self.ui.set_workspace_title(self.workspace.name, path_text, self.workspace.dirty)
+        self.ui.set_project_tree(
+            self.workspace.projects,
+            self.workspace.active_project_id,
+            active_project.active_run_id,
+        )
+        self.ui.set_quick_configs(self.workspace.quick_configs)
+
+    def _project_file_filter(self) -> str:
+        return (
+            "Keithley Workspaces (*.keithley-workspace.sqlite);;"
+            "Legacy JSON Workspaces (*.keithley-workspace.json *.json);;"
+            "All Files (*)"
+        )
+
+    def _default_project_path(self) -> str:
+        return "untitled.keithley-workspace.sqlite"
+
+    def _autosave_project(self) -> None:
+        if self.workspace.path is None:
+            self.refresh_project_ui()
+            return
+        try:
+            self.workspace.save()
+        except Exception as exc:
+            QMessageBox.warning(
+                self.ui,
+                "Workspace Autosave Failed",
+                f"Could not save workspace automatically.\n{exc}",
+            )
+        self.refresh_project_ui()
+
+    def _set_workspace(self, workspace: WorkspaceDocument) -> None:
+        self._run_data_cache.clear()
+        self.workspace = workspace
+        active_project = self.workspace.active_project()
+        self._current_run_id = active_project.active_run_id
+        self.refresh_project_ui()
+        active_run = active_project.active_run()
+        if active_run is not None:
+            self._load_run_into_ui(active_run)
+        else:
+            self._apply_settings_without_default_update(active_project.default_settings)
+            self.ui.graph_plot_placeholder.clear_plot()
+            self.ui.data_table.setRowCount(0)
+
+    def handle_new_project(self) -> None:
+        if not self._confirm_discard_unsaved_project():
+            return
+        self._set_workspace(WorkspaceDocument.new(self.ui.collect_settings()))
+
+    def handle_open_project(self) -> None:
+        if not self._confirm_discard_unsaved_project():
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self.ui,
+            "Open Workspace",
+            "",
+            self._project_file_filter(),
+        )
+        if not file_path:
+            return
+        try:
+            workspace = WorkspaceDocument.load(file_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self.ui,
+                "Open Workspace Failed",
+                f"Could not open workspace.\n{exc}",
+            )
+            return
+        self._set_workspace(workspace)
+
+    def handle_save_project(self) -> None:
+        if self.workspace.path is None:
+            self.handle_save_project_as()
+            return
+        try:
+            self.workspace.save()
+        except Exception as exc:
+            QMessageBox.critical(
+                self.ui,
+                "Save Workspace Failed",
+                f"Could not save workspace.\n{exc}",
+            )
+            return
+        self.refresh_project_ui()
+
+    def handle_save_project_as(self) -> None:
+        start_path = str(self.workspace.path) if self.workspace.path else self._default_project_path()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.ui,
+            "Save Workspace As",
+            start_path,
+            self._project_file_filter(),
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith((".sqlite", ".db", ".sqlite3", ".json")):
+            file_path = f"{file_path}.keithley-workspace.sqlite"
+        try:
+            self.workspace.save(file_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self.ui,
+                "Save Workspace Failed",
+                f"Could not save workspace.\n{exc}",
+            )
+            return
+        self._run_data_cache.clear()
+        self.refresh_project_ui()
+
+    def _confirm_discard_unsaved_project(self) -> bool:
+        if not self.workspace.dirty:
+            return True
+        answer = QMessageBox.question(
+            self.ui,
+            "Unsaved Workspace",
+            "The current workspace has unsaved changes. Continue without saving?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    def handle_new_project_record(self) -> None:
+        name = f"Project {self.workspace.next_project_id}"
+        project = self.workspace.add_project(name, self.ui.collect_settings())
+        self.workspace.active_project_id = project.id
+        self._current_run_id = None
+        self.ui.graph_plot_placeholder.clear_plot()
+        self.ui.data_table.setRowCount(0)
+        self._autosave_project()
+
+    def handle_save_quick_config(self) -> None:
+        name = f"Config {self.workspace.next_config_id}"
+        self.workspace.add_quick_config(name, self.ui.collect_settings())
+        self._autosave_project()
+
+    def handle_quick_config_clicked(self, config_id: int) -> None:
+        config = self.workspace.get_quick_config(config_id)
+        if config is None:
+            return
+        self.ui.apply_settings(config.settings)
+        self._store_current_settings_as_project_default()
+
+    def handle_rename_quick_config(self, config_id: int) -> None:
+        config = self.workspace.get_quick_config(config_id)
+        if config is None:
+            return
+        dialog = QInputDialog(self.ui)
+        dialog.setInputMode(QInputDialog.TextInput)
+        dialog.setWindowTitle("Rename Config")
+        dialog.setLabelText(f"Name (max {MAX_QUICK_CONFIG_NAME_LENGTH} characters):")
+        dialog.setTextValue(config.name)
+        line_edit = dialog.findChild(QLineEdit)
+        if line_edit is not None:
+            line_edit.setMaxLength(MAX_QUICK_CONFIG_NAME_LENGTH)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        text = dialog.textValue()
+        self.workspace.rename_quick_config(config_id, text)
+        self._autosave_project()
+
+    def handle_quick_config_quick_access_toggled(
+        self,
+        config_id: int,
+        enabled: bool,
+    ) -> None:
+        if self.workspace.set_quick_config_quick_access(config_id, enabled):
+            self._autosave_project()
+            return
+        self.refresh_project_ui()
+
+    def handle_delete_quick_config(self, config_id: int) -> None:
+        config = self.workspace.get_quick_config(config_id)
+        if config is None:
+            return
+        answer = QMessageBox.question(
+            self.ui,
+            "Delete Config",
+            f"Delete quick config '{config.name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.workspace.delete_quick_config(config_id)
+        self._autosave_project()
+
+    def handle_project_selected(self, project_id: int) -> None:
+        project = self.workspace.get_project(project_id)
+        if project is None:
+            return
+        self.workspace.active_project_id = project.id
+        self._current_run_id = project.active_run_id
+        active_run = project.active_run()
+        if active_run is not None:
+            self._load_run_into_ui(active_run)
+        else:
+            self._apply_settings_without_default_update(project.default_settings)
+            self.ui.graph_plot_placeholder.clear_plot()
+            self.ui.data_table.setRowCount(0)
+        self.workspace.mark_dirty()
+        self._autosave_project()
+
+    def handle_rename_project(self, project_id: int) -> None:
+        project = self.workspace.get_project(project_id)
+        if project is None:
+            return
+        text, ok = QInputDialog.getText(
+            self.ui,
+            "Rename Project",
+            "Name (max 30 characters):",
+            text=project.name,
+        )
+        if not ok:
+            return
+        self.workspace.rename_project(project_id, text)
+        self._autosave_project()
+
+    def handle_delete_project(self, project_id: int) -> None:
+        project = self.workspace.get_project(project_id)
+        if project is None:
+            return
+        if len(self.workspace.projects) <= 1:
+            QMessageBox.information(
+                self.ui,
+                "Delete Project",
+                "A workspace must contain at least one project.",
+            )
+            return
+        answer = QMessageBox.question(
+            self.ui,
+            "Delete Project",
+            f"Delete project '{project.name}' and all of its runs?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._run_data_cache.invalidate_project(self.workspace.path, project.id)
+        self.workspace.delete_project(project_id)
+        active_project = self.workspace.active_project()
+        self._current_run_id = active_project.active_run_id
+        active_run = active_project.active_run()
+        if active_run is not None:
+            self._load_run_into_ui(active_run)
+        else:
+            self._apply_settings_without_default_update(active_project.default_settings)
+            self.ui.graph_plot_placeholder.clear_plot()
+            self.ui.data_table.setRowCount(0)
+        self._autosave_project()
+
+    def handle_run_selected(self, project_id: int, run_id: int) -> None:
+        project = self.workspace.get_project(project_id)
+        if project is None:
+            return
+        run = project.get_run(run_id)
+        if run is None:
+            return
+        self.workspace.active_project_id = project.id
+        project.active_run_id = run.id
+        self._current_run_id = run.id
+        self.workspace.mark_dirty()
+        self._load_run_into_ui(run)
+        self._autosave_project()
+
+    def handle_rename_run(self, project_id: int, run_id: int) -> None:
+        project = self.workspace.get_project(project_id)
+        if project is None:
+            return
+        run = project.get_run(run_id)
+        if run is None:
+            return
+        text, ok = QInputDialog.getText(
+            self.ui,
+            "Rename Run",
+            "Name (max 30 characters):",
+            text=run.name,
+        )
+        if not ok:
+            return
+        project.rename_run(run_id, text)
+        self.workspace.mark_dirty()
+        self._autosave_project()
+
+    def handle_delete_run(self, project_id: int, run_id: int) -> None:
+        project = self.workspace.get_project(project_id)
+        if project is None:
+            return
+        run = project.get_run(run_id)
+        if run is None:
+            return
+        answer = QMessageBox.question(
+            self.ui,
+            "Delete Run",
+            f"Delete RUN {run.id}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._run_data_cache.invalidate(self._run_cache_key(run, project.id))
+        project.delete_run(run_id)
+        self.workspace.active_project_id = project.id
+        self._current_run_id = project.active_run_id
+        active_run = project.active_run()
+        if active_run is not None:
+            self._load_run_into_ui(active_run)
+        else:
+            self._apply_settings_without_default_update(project.default_settings)
+            self.ui.graph_plot_placeholder.clear_plot()
+            self.ui.data_table.setRowCount(0)
+        self.workspace.mark_dirty()
+        self._autosave_project()
+
+    def _load_run_into_ui(self, run: RunRecord) -> None:
+        active_view = self._active_run_view()
+        self.ui.show_loading("Loading run settings...", 100)
+        QApplication.processEvents()
+        try:
+            self._apply_settings_without_default_update(run.settings)
+            self.ui.graph_plot_placeholder.clear_plot()
+            self.ui.data_table.setRowCount(0)
+            graph_cfg = run.graph if isinstance(run.graph, dict) else {}
+            x_axis = str(graph_cfg.get("x_axis", "SMU1 Voltage"))
+            y_axis = str(graph_cfg.get("y_axis", "SMU1 Current"))
+            display_mode = str(graph_cfg.get("display_mode", "linear"))
+            show_ramping = bool(graph_cfg.get("show_ramping", True))
+
+            self.ui.x_axis_combo.blockSignals(True)
+            self.ui.y_axis_combo.blockSignals(True)
+            if x_axis in [self.ui.x_axis_combo.itemText(i) for i in range(self.ui.x_axis_combo.count())]:
+                self.ui.x_axis_combo.setCurrentText(x_axis)
+            if y_axis in [self.ui.y_axis_combo.itemText(i) for i in range(self.ui.y_axis_combo.count())]:
+                self.ui.y_axis_combo.setCurrentText(y_axis)
+            self.ui.x_axis_combo.blockSignals(False)
+            self.ui.y_axis_combo.blockSignals(False)
+            self.ui.graph_plot_placeholder.set_axes(x_axis, y_axis)
+            self.handle_graph_scale_change(display_mode)
+            self.ui.graph_show_ramping_check.blockSignals(True)
+            self.ui.graph_show_ramping_check.setChecked(show_ramping)
+            self.ui.graph_show_ramping_check.blockSignals(False)
+            self.ui.graph_plot_placeholder.set_show_ramping(show_ramping)
+
+            self._active_run_view_key = self._run_cache_key(run)
+            self._rendered_graph_key = None
+            self._rendered_table_key = None
+            if active_view == "graph":
+                self._render_graph_for_run(run)
+            elif active_view == "table":
+                self._render_table_for_run(run)
+            else:
+                self._update_ramping_filter_availability(run.settings, [])
+            self.ui.update_loading(100, "Run loaded")
+            QApplication.processEvents()
+        finally:
+            self.ui.hide_loading()
+
+    def _active_run_view(self) -> str:
+        current_widget = self.ui.tab_widget.currentWidget()
+        if current_widget is self.ui.graph_tab:
+            return "graph"
+        if current_widget is self.ui.table_tab:
+            return "table"
+        return "settings"
+
+    def handle_run_view_tab_changed(self, index: int) -> None:
+        run = self._current_project_run()
+        if run is None:
+            return
+        active_view = self._active_run_view()
+        if active_view == "graph":
+            self.ui.show_loading("Rendering graph...", 100)
+            QApplication.processEvents()
+            try:
+                self._render_graph_for_run(run)
+            finally:
+                self.ui.hide_loading()
+        elif active_view == "table":
+            self.ui.show_loading("Rendering table...", 100)
+            QApplication.processEvents()
+            try:
+                self._render_table_for_run(run)
+            finally:
+                self.ui.hide_loading()
+
+    def _load_payloads_for_run(self, run: RunRecord) -> list[dict]:
+        def load_progress(value: int, total: int, message: str) -> None:
+            percent = 15 if total <= 0 else 15 + int((value / max(1, total)) * 45)
+            self.ui.update_loading(min(60, percent), message)
+            QApplication.processEvents()
+
+        cache_key = self._run_cache_key(run)
+        cached_payloads = self._run_data_cache.get(cache_key)
+        if cached_payloads is not None:
+            self.ui.update_loading(60, "Loading data from cache...")
+            QApplication.processEvents()
+            run.data = cached_payloads
+            return cached_payloads
+        payloads = self.workspace.load_run_points(run, progress_callback=load_progress)
+        self._run_data_cache.set(cache_key, payloads)
+        return payloads
+
+    def _render_graph_for_run(self, run: RunRecord) -> None:
+        cache_key = self._run_cache_key(run)
+        if self._rendered_graph_key == cache_key:
+            return
+        payloads = self._load_payloads_for_run(run)
+        self._update_ramping_filter_availability(run.settings, payloads)
+        self.ui.update_loading(88, "Rendering graph...")
+        QApplication.processEvents()
+        self.ui.graph_plot_placeholder.set_payloads(payloads)
+        self._rendered_graph_key = cache_key
+
+    def _render_table_for_run(self, run: RunRecord) -> None:
+        cache_key = self._run_cache_key(run)
+        if self._rendered_table_key == cache_key:
+            return
+        payloads = self._load_payloads_for_run(run)
+        self._update_ramping_filter_availability(run.settings, payloads)
+        self.ui.update_loading(62, "Rendering table...")
+        QApplication.processEvents()
+        self._render_table_payloads(
+            self._table_payloads(payloads),
+            progress_callback=lambda value, total: self._update_render_progress(
+                value,
+                total,
+                62,
+                84,
+                "Rendering table...",
+            ),
+        )
+        self._rendered_table_key = cache_key
+
+    def _run_cache_key(
+        self,
+        run: RunRecord,
+        project_id: int | None = None,
+    ) -> RunCacheKey | None:
+        if project_id is None:
+            project = self.workspace.active_project()
+            project_id = project.id
+        return self._run_data_cache.make_key(
+            self.workspace.path,
+            int(project_id),
+            int(run.id),
+            run.storage_id,
+        )
+
+    def _update_render_progress(
+        self,
+        value: int,
+        total: int,
+        start: int,
+        end: int,
+        message: str,
+    ) -> None:
+        if total <= 0:
+            self.ui.update_loading(end, message)
+        else:
+            self.ui.update_loading(start + int((value / max(1, total)) * (end - start)), message)
+        QApplication.processEvents()
+
+    def _render_table_payloads(
+        self,
+        payloads: list[dict],
+        progress_callback: Any | None = None,
+    ) -> None:
+        self.ui.data_table.setRowCount(0)
+        total = len(payloads)
+        notify_every = max(1, total // 100) if total else 1
+        for payload in payloads:
+            row = self.ui.data_table.rowCount()
+            self.ui.data_table.insertRow(row)
+            self._fill_table_row(row, payload)
+            if progress_callback is not None and (row + 1 == total or (row + 1) % notify_every == 0):
+                progress_callback(row + 1, total)
+
+    def _active_graph_settings(self) -> dict[str, Any]:
+        return {
+            "x_axis": str(self.ui.x_axis_combo.currentText() or "SMU1 Voltage"),
+            "y_axis": str(self.ui.y_axis_combo.currentText() or "SMU1 Current"),
+            "display_mode": "log" if self.ui.graph_log_btn.isChecked() else "linear",
+            "show_ramping": bool(self.ui.graph_show_ramping_check.isChecked()),
+        }
+
+    def _begin_project_run(self, settings: dict[str, Any]) -> RunRecord:
+        project = self.workspace.active_project()
+        run = project.add_run(settings)
+        run.status = "running"
+        run.started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        run.finished_at = None
+        run.data.clear()
+        run.graph = self._active_graph_settings()
+        self._current_run_id = run.id
+        self._active_run_view_key = self._run_cache_key(run, project.id)
+        self._rendered_graph_key = None
+        self._rendered_table_key = None
+        self._run_failed = False
+        self._run_aborted = False
+        self.workspace.mark_dirty()
+        self.refresh_project_ui()
+        self._run_data_cache.invalidate(self._run_cache_key(run, project.id))
+        return run
+
+    def _current_project_run(self) -> RunRecord | None:
+        return self.workspace.active_project().get_run(self._current_run_id)
+
+    def _store_current_settings_as_project_default(self) -> None:
+        project = self.workspace.active_project()
+        project.default_settings = self.ui.collect_settings()
+        project.mark_dirty()
+        self.workspace.mark_dirty()
+
+    def handle_project_default_settings_changed(self, *args: object) -> None:
+        if self._suppress_project_default_update:
+            return
+        self._store_current_settings_as_project_default()
+        self.refresh_project_ui()
+
+    def _apply_settings_without_default_update(self, settings: dict[str, Any]) -> None:
+        self._suppress_project_default_update = True
+        try:
+            self.ui.apply_settings(settings, emit_changed=False)
+            self.update_preview_and_summary()
+        finally:
+            self._suppress_project_default_update = False
 
     def handle_step_value_changed(self, smu_index: int, requested_step: float) -> None:
         if self._syncing_step_controls:
@@ -794,6 +1436,13 @@ class MainController:
     def _line_frequency_hz(self) -> float:
         return 50.0
 
+    def _refresh_summary_tooltips(self) -> None:
+        for smu_index in (1, 2):
+            for field in ("function", "mode", "source", "limit", "measure", "ramp"):
+                label = getattr(self.ui, f"smu{smu_index}_{field}_label", None)
+                if label is not None:
+                    label.setToolTip(label.text())
+
     def _set_step_control_value(
         self,
         smu_index: int,
@@ -830,10 +1479,77 @@ class MainController:
 
     def handle_graph_axis_change(self, *args: object) -> None:
         """Redraw the measurement graph with the selected payload axes."""
+        self._rendered_graph_key = None
         self.ui.graph_plot_placeholder.set_axes(
             str(self.ui.x_axis_combo.currentText() or "Time"),
             str(self.ui.y_axis_combo.currentText() or "SMU1 Current"),
         )
+        run = self._current_project_run()
+        if run is not None and not self._suppress_project_default_update:
+            run.graph = self._active_graph_settings()
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
+
+    def handle_graph_ramping_visibility_change(self, *args: object) -> None:
+        """Show or hide ramp-up/down points in the graph without deleting them."""
+        self._rendered_graph_key = None
+        self.ui.graph_plot_placeholder.set_show_ramping(
+            bool(self.ui.graph_show_ramping_check.isChecked())
+        )
+        run = self._current_project_run()
+        if run is not None and not self._suppress_project_default_update:
+            run.graph = self._active_graph_settings()
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
+
+    def handle_table_ramping_visibility_change(self, *args: object) -> None:
+        """Show or hide ramp-up/down points in the table and CSV export."""
+        run = self._current_project_run()
+        self._rendered_table_key = None
+        payloads = list(run.data) if run is not None else []
+        self._render_table_payloads(self._table_payloads(payloads))
+
+    def handle_ramping_filter_availability_change(self, *args: object) -> None:
+        """Refresh ramping controls when the current setup changes."""
+        self._update_ramping_filter_availability(self.ui.collect_settings())
+
+    def _update_ramping_filter_availability(
+        self,
+        settings: dict[str, Any] | None = None,
+        payloads: list[dict] | None = None,
+    ) -> None:
+        has_ramp = self._settings_have_enabled_ramp(settings or {})
+        if payloads is None:
+            run = self._current_project_run()
+            if run is not None:
+                payloads = list(run.data)
+        if payloads is not None:
+            has_ramp = has_ramp or any(self._is_ramping_payload(payload) for payload in payloads)
+
+        self.ui.graph_show_ramping_check.setVisible(has_ramp)
+        self.ui.csv_show_ramping_check.setVisible(has_ramp)
+
+    def _settings_have_enabled_ramp(self, settings: dict[str, Any]) -> bool:
+        for smu_key in ("smu1", "smu2"):
+            smu_cfg = settings.get(smu_key, {})
+            if not isinstance(smu_cfg, dict):
+                continue
+            if str(smu_cfg.get("mode", "")).strip().lower() != "sweep":
+                continue
+            for ramp_key in ("ramp_up", "ramp_down"):
+                ramp_cfg = smu_cfg.get(ramp_key, {})
+                if isinstance(ramp_cfg, dict) and bool(ramp_cfg.get("enabled", False)):
+                    return True
+        return False
+
+    def _is_ramping_payload(self, payload: dict) -> bool:
+        phase = str(payload.get("sweep_phase", "")).strip().lower()
+        return phase in {"ramp_up", "ramp_down"} or bool(payload.get("is_ramp", False))
+
+    def _table_payloads(self, payloads: list[dict]) -> list[dict]:
+        if bool(self.ui.csv_show_ramping_check.isChecked()):
+            return payloads
+        return [payload for payload in payloads if not self._is_ramping_payload(payload)]
 
     def _set_connected_status(self, model_name: str | None = None) -> None:
         status_text = "Connected"
@@ -997,7 +1713,7 @@ class MainController:
         """Load a previously saved UI configuration from a JSON file."""
         file_path, _ = QFileDialog.getOpenFileName(
             self.ui,
-            "Import Configuration",
+            "Load Configuration",
             "",
             "JSON Files (*.json)",
         )
@@ -1010,7 +1726,7 @@ class MainController:
         except Exception as exc:
             QMessageBox.critical(
                 self.ui,
-                "Import Failed",
+                "Load Failed",
                 f"Could not read configuration file.\n{exc}",
             )
             return
@@ -1019,7 +1735,7 @@ class MainController:
         if not isinstance(settings, dict):
             QMessageBox.critical(
                 self.ui,
-                "Import Failed",
+                "Load Failed",
                 "The selected file is not a valid configuration file.",
             )
             return
@@ -1364,6 +2080,7 @@ class MainController:
             mark_summary_disabled(1)
         if not enabled2:
             mark_summary_disabled(2)
+        self._refresh_summary_tooltips()
 
         # ----- Calculated total points (global) -----
         if enabled1 and not enabled2:
@@ -1409,7 +2126,6 @@ class MainController:
                     )
                     pulse_total_points = len(pulse_plan.source_levels)
                     pulse_point_interval_s = pulse_plan.point_interval_s
-                    self._log_pulse_list_sweep_plan(pulse_plan)
                 else:
                     pulse_timeline = build_pulse_timeline(
                         pulse_events,
@@ -1435,11 +2151,13 @@ class MainController:
             total_points = max(0, pri_actual_pts) * max(0, step_actual_pts) * repeats
 
         if pulse_point_interval_s is not None:
-            self.ui.calculated_points_label.setText(
+            calculated_points_text = (
                 f"{total_points:,} points, interval \u2248 {pulse_point_interval_s:.6g} s"
             )
         else:
-            self.ui.calculated_points_label.setText(f"{total_points:,}")
+            calculated_points_text = f"{total_points:,}"
+        self.ui.calculated_points_label.setText(calculated_points_text)
+        self.ui.calculated_points_label.setToolTip(calculated_points_text)
 
         # ----- Pack config and update Output Preview -----
         src_meas_delay = float(self.ui.src_meas_delay_spin.value())
@@ -1686,15 +2404,18 @@ class MainController:
                 }
                 bias_measure_cfg = other_settings.get("measure", {})
 
+            current_run = self._begin_project_run(settings)
             self.ui.graph_plot_placeholder.clear_plot()
             self.ui.data_table.setRowCount(0)
+            self._update_ramping_filter_availability(settings)
             self.ui.tab_widget.setCurrentWidget(self.ui.graph_tab)
-            self.ui.x_axis_combo.setCurrentText("Time")
-            self.ui.y_axis_combo.setCurrentText(f"{smu_name.replace(' ', '')} Current")
             self.ui.graph_plot_placeholder.set_axes(
-                "Time",
-                f"{smu_name.replace(' ', '')} Current",
+                str(self.ui.x_axis_combo.currentText() or "Time"),
+                str(self.ui.y_axis_combo.currentText() or "SMU1 Current"),
             )
+            current_run.graph = self._active_graph_settings()
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
             self._autoscale_after_first_point = True
             QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
 
@@ -1881,17 +2602,19 @@ class MainController:
 
         points = max(2, int(primary_points)) if pri_mode == "sweep" else 2
 
+        current_run = self._begin_project_run(settings)
         # ----- Clear UI before starting -----
         self.ui.graph_plot_placeholder.clear_plot()
         self.ui.data_table.setRowCount(0)
+        self._update_ramping_filter_availability(settings)
         self.ui.tab_widget.setCurrentWidget(self.ui.graph_tab)
-        primary_axis_prefix = "SMU1" if primary_channel == "smua" else "SMU2"
-        self.ui.x_axis_combo.setCurrentText(f"{primary_axis_prefix} Voltage")
-        self.ui.y_axis_combo.setCurrentText(f"{primary_axis_prefix} Current")
         self.ui.graph_plot_placeholder.set_axes(
-            f"{primary_axis_prefix} Voltage",
-            f"{primary_axis_prefix} Current",
+            str(self.ui.x_axis_combo.currentText() or "SMU1 Voltage"),
+            str(self.ui.y_axis_combo.currentText() or "SMU1 Current"),
         )
+        current_run.graph = self._active_graph_settings()
+        self.workspace.active_project().mark_dirty()
+        self.workspace.mark_dirty()
         self._autoscale_after_first_point = True
         QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
 
@@ -1953,10 +2676,25 @@ class MainController:
             self.ui.run_btn.setEnabled(True)
             return
         self.ui.abort_btn.setEnabled(False)
+        self._run_aborted = True
+        run = self._current_project_run()
+        if run is not None:
+            run.status = "aborted"
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
+            self.refresh_project_ui()
         worker.requestInterruption()
 
     def handle_sweep_error(self, message: str) -> None:
         """Show sweep failures from the worker thread in the UI."""
+        self._run_failed = True
+        run = self._current_project_run()
+        if run is not None:
+            run.status = "failed"
+            run.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
+            self.refresh_project_ui()
         QMessageBox.critical(
             self.ui,
             "Sweep Failed",
@@ -1967,11 +2705,30 @@ class MainController:
         """
         Slot for SweepWorker.data_ready: update graph and table in the UI thread.
         """
+        run = self._current_project_run()
+        if run is not None:
+            run.data.append(clone_json(payload))
+            run.graph = self._active_graph_settings()
+            try:
+                self.workspace.append_run_point(
+                    self.workspace.active_project().id,
+                    run.id,
+                    clone_json(payload),
+                )
+            except Exception as exc:
+                print(f"Failed to persist run point: {exc}")
+            self._run_data_cache.append(
+                self._run_cache_key(run, self.workspace.active_project().id),
+                payload,
+            )
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
         self.ui.graph_plot_placeholder.append_payload(payload)
 
-        row = self.ui.data_table.rowCount()
-        self.ui.data_table.insertRow(row)
-        self._fill_table_row(row, payload)
+        if self._table_payloads([payload]):
+            row = self.ui.data_table.rowCount()
+            self.ui.data_table.insertRow(row)
+            self._fill_table_row(row, payload)
         if self._autoscale_after_first_point:
             self._autoscale_after_first_point = False
             QTimer.singleShot(0, self.ui.graph_plot_placeholder.autoscale)
@@ -1980,6 +2737,19 @@ class MainController:
         """Restore Run/Abort button state after worker finishes."""
         self.ui.run_btn.setEnabled(True)
         self.ui.abort_btn.setEnabled(False)
+        run = self._current_project_run()
+        if run is not None:
+            if self._run_failed:
+                run.status = "failed"
+            elif self._run_aborted:
+                run.status = "aborted"
+            elif run.status == "running":
+                run.status = "completed"
+            run.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            run.graph = self._active_graph_settings()
+            self.workspace.active_project().mark_dirty()
+            self.workspace.mark_dirty()
+        self._autosave_project()
 
     def _fill_table_row(self, row: int, payload: dict) -> None:
         """Fill one table row with measured V/I/R values for both SMUs."""

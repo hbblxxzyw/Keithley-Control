@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 .venv/
+NI trace/
+pulse_generated_list.csv

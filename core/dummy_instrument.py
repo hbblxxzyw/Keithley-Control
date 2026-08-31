@@ -6,6 +6,7 @@ measurements return fake data.
 """
 
 from collections.abc import Callable, Generator
+import math
 
 from core.instrument_base import AbstractSMU
 from core.pulse_sequence import PulseEvent, PulseTimelinePoint
@@ -362,43 +363,64 @@ class DummyKeithley2636(AbstractSMU):
         if stop_checker is not None and stop_checker():
             raise InterruptedError("Sweep aborted by user.")
         secondary_channel = "smub" if smu_channel == "smua" else "smua"
-        step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
-        voltages = [start_v + i * step for i in range(points)]
-        currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
-        if str(secondary_mode).strip().lower() == "linear":
-            sec_start = secondary_start_v if secondary_start_v is not None else secondary_level
-            sec_stop = secondary_stop_v if secondary_stop_v is not None else secondary_level
-            sec_step = (sec_stop - sec_start) / (points - 1) if points > 1 else 0.0
-            secondary_source_values = [sec_start + i * sec_step for i in range(points)]
-        else:
-            secondary_source_values = [float(secondary_level)] * points
-        secondary_voltage = float(
-            secondary_source_values[-1]
-            if secondary_source_values
-            else self._source_levels.get(secondary_channel, 0.0)
-        )
-        secondary_currents = [
-            8.9e-7 + secondary_source * 8e-8 + index * 1e-9
-            for index, secondary_source in enumerate(secondary_source_values)
-        ]
-        measured_voltages = None
-        secondary_measured_voltages = None
-        timestamps = [float(index) * max(delay, 0.0) for index in range(points)]
-        if measurement_items and any(
-            item in {"Voltage", "Resistance"} for item in measurement_items
+
+        def emit_block(
+            block_start: float,
+            block_stop: float,
+            block_points: int,
+            block_delay: float,
         ):
-            measured_voltages = list(voltages)
-        yield (
-            voltages,
-            currents,
-            measured_voltages,
-            secondary_source_values,
-            secondary_currents,
-            secondary_measured_voltages,
-            timestamps,
-        )
-        self._source_levels[smu_channel] = float(voltages[-1])
-        self._source_levels[secondary_channel] = float(secondary_voltage)
+            step = (block_stop - block_start) / (block_points - 1) if block_points > 1 else 0.0
+            voltages = [block_start + i * step for i in range(block_points)]
+            currents = [1.23e-6 + (v - block_start) * 1e-7 for v in voltages]
+            if str(secondary_mode).strip().lower() == "linear":
+                sec_start = secondary_start_v if secondary_start_v is not None else secondary_level
+                sec_stop = secondary_stop_v if secondary_stop_v is not None else secondary_level
+                sec_step = (sec_stop - sec_start) / (block_points - 1) if block_points > 1 else 0.0
+                secondary_source_values = [
+                    sec_start + i * sec_step for i in range(block_points)
+                ]
+            else:
+                secondary_source_values = [float(secondary_level)] * block_points
+            secondary_voltage = float(
+                secondary_source_values[-1]
+                if secondary_source_values
+                else self._source_levels.get(secondary_channel, 0.0)
+            )
+            secondary_currents = [
+                8.9e-7 + secondary_source * 8e-8 + index * 1e-9
+                for index, secondary_source in enumerate(secondary_source_values)
+            ]
+            measured_voltages = None
+            secondary_measured_voltages = None
+            timestamps = [
+                float(index) * max(block_delay, 0.0) for index in range(block_points)
+            ]
+            if measurement_items and any(
+                item in {"Voltage", "Resistance"} for item in measurement_items
+            ):
+                measured_voltages = list(voltages)
+            yield (
+                voltages,
+                currents,
+                measured_voltages,
+                secondary_source_values,
+                secondary_currents,
+                secondary_measured_voltages,
+                timestamps,
+            )
+            self._source_levels[smu_channel] = float(voltages[-1])
+            self._source_levels[secondary_channel] = float(secondary_voltage)
+
+        if ramp_up and abs(start_v) > 0:
+            ramp_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
+            yield from emit_block(0.0, start_v, ramp_points, ru_delay)
+
+        yield from emit_block(start_v, stop_v, points, delay)
+
+        if ramp_down and abs(stop_v) > 0:
+            ramp_points = max(2, int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1)
+            yield from emit_block(stop_v, 0.0, ramp_points, rd_delay)
 
     def run_single_smu_sweep(
         self,
@@ -434,14 +456,33 @@ class DummyKeithley2636(AbstractSMU):
             raise InterruptedError("Sweep aborted by user.")
         inactive_channel = "smub" if smu_channel == "smua" else "smua"
         self._source_levels[inactive_channel] = 0.0
-        step = (stop_v - start_v) / (points - 1) if points > 1 else 0.0
-        voltages = [start_v + i * step for i in range(points)]
-        currents = [1.23e-6 + (v - start_v) * 1e-7 for v in voltages]
-        measured_voltages = None
-        timestamps = [float(index) * max(delay, 0.0) for index in range(points)]
-        if measurement_items and any(
-            item in {"Voltage", "Resistance"} for item in measurement_items
+
+        def emit_block(
+            block_start: float,
+            block_stop: float,
+            block_points: int,
+            block_delay: float,
         ):
-            measured_voltages = list(voltages)
-        yield (voltages, currents, measured_voltages, timestamps)
-        self._source_levels[smu_channel] = float(voltages[-1])
+            step = (block_stop - block_start) / (block_points - 1) if block_points > 1 else 0.0
+            voltages = [block_start + i * step for i in range(block_points)]
+            currents = [1.23e-6 + (v - block_start) * 1e-7 for v in voltages]
+            measured_voltages = None
+            timestamps = [
+                float(index) * max(block_delay, 0.0) for index in range(block_points)
+            ]
+            if measurement_items and any(
+                item in {"Voltage", "Resistance"} for item in measurement_items
+            ):
+                measured_voltages = list(voltages)
+            yield (voltages, currents, measured_voltages, timestamps)
+            self._source_levels[smu_channel] = float(voltages[-1])
+
+        if ramp_up and abs(start_v) > 0:
+            ramp_points = max(2, int(math.ceil(abs(start_v) / max(ru_step, 1e-9))) + 1)
+            yield from emit_block(0.0, start_v, ramp_points, ru_delay)
+
+        yield from emit_block(start_v, stop_v, points, delay)
+
+        if ramp_down and abs(stop_v) > 0:
+            ramp_points = max(2, int(math.ceil(abs(stop_v) / max(rd_step, 1e-9))) + 1)
+            yield from emit_block(stop_v, 0.0, ramp_points, rd_delay)
